@@ -1,1 +1,3 @@
 # MP3-AI-Player
+
+El trabajo consiste en un reproductor MP3 en el cual va a tener una lista cargada de diferentes géneros, épocas, cantantes, álbumes de música (Rock Nacional, Reguetón, Rock Alternativo, Phene). El reproductor constará de un bot de telegram por el cual entienda lo que yo le escribo, para que después el siguiente paso sea a mensajes de voz  con la misma aplicación. También una inteligencia artificial incorporada para qué, en base a nuestras instrucciones, encuentre la canción o tipo de género que se desea escuchar a través de una base de datos, que es donde se van a cargar todas las canciones y se organizarán con sus etiquetas ID3 (metadata).
