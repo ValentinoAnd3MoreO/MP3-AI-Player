@@ -1,0 +1,5 @@
+openai>=1.30,<3
+pymongo>=4.7,<5
+python-dotenv>=1.0,<2
+python-telegram-bot>=21,<23
+requests>=2.31,<3
