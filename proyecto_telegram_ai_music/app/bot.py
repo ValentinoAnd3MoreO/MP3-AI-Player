@@ -12,7 +12,12 @@ from telegram.ext import (
     filters,
 )
 
-from app.ai_service import AIService, WebSearch
+from app.ai_service import (
+    AIQuotaExceededError,
+    AIRateLimitError,
+    AIService,
+    WebSearch,
+)
 from app.config import Settings
 from app.database import SongDatabase
 from app.recommender import Recommender
@@ -57,6 +62,22 @@ async def recommend_text(
         songs, web_failed = await asyncio.to_thread(
             recommender.recommend, request_text
         )
+    except AIQuotaExceededError:
+        logger.warning("La cuenta del proveedor de IA no tiene créditos disponibles.")
+        await update.message.reply_text(
+            "La cuenta de OpenAI se quedó sin créditos o alcanzó su cuota. "
+            "Revisa la facturación y el uso de la API en "
+            "https://platform.openai.com/settings/organization/billing/ "
+            "y vuelve a intentarlo."
+        )
+        return
+    except AIRateLimitError:
+        logger.warning("El proveedor de IA está limitando temporalmente las solicitudes.")
+        await update.message.reply_text(
+            "OpenAI está recibiendo demasiadas solicitudes por ahora. "
+            "Espera un poco e inténtalo de nuevo."
+        )
+        return
     except Exception:
         logger.exception("Falló la recomendación")
         await update.message.reply_text(

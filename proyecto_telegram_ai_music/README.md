@@ -13,6 +13,7 @@ Todo este prototipo vive en esta carpeta; no modifica el código de las otras ca
 - Opcionalmente consulta Internet mediante Tavily y entrega esos resultados como contexto adicional a la IA.
 - Solicita a la IA que ordene las canciones candidatas y valida que cada ID elegido exista en MongoDB.
 - Si la búsqueda web no está disponible, registra el problema y continúa usando la biblioteca local. Si falla el proveedor de IA, el bot informa que no pudo completar la búsqueda.
+- Si OpenAI indica que se agotaron los créditos/cuota, el bot muestra un aviso específico y un enlace a facturación; los límites temporales de solicitudes se notifican por separado.
 
 Este prototipo recomienda; todavía no reproduce ni envía archivos de audio.
 

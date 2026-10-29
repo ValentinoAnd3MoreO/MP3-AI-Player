@@ -1,6 +1,20 @@
 import unittest
 
+from app.ai_service import _is_quota_error
 from app.recommender import Recommender, build_mongo_query
+
+
+class AIQuotaDetectionTests(unittest.TestCase):
+    def test_detects_openai_insufficient_quota_code(self):
+        error = Exception("API request failed")
+        error.code = "insufficient_quota"
+        self.assertTrue(_is_quota_error(error))
+
+    def test_detects_credit_exhaustion_message(self):
+        self.assertTrue(_is_quota_error(Exception("You have no credits remaining")))
+
+    def test_does_not_mistake_temporary_rate_limit_for_empty_credits(self):
+        self.assertFalse(_is_quota_error(Exception("Too many requests")))
 
 
 class BuildMongoQueryTests(unittest.TestCase):

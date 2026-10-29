@@ -4,13 +4,35 @@ import re
 from typing import Any
 
 import requests
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
 _FILTER_KEYS = {"artist", "genre", "decade", "mood", "keywords", "limit"}
+
+
+class AIQuotaExceededError(Exception):
+    """The configured AI provider has no usable credits or quota."""
+
+
+class AIRateLimitError(Exception):
+    """The configured AI provider is temporarily rate limiting requests."""
+
+
+def _is_quota_error(error: Exception) -> bool:
+    code = str(getattr(error, "code", "") or "").lower()
+    message = str(error).lower()
+    return code in {"insufficient_quota", "credit_balance_exhausted"} or any(
+        phrase in message
+        for phrase in (
+            "no credits remaining",
+            "credit_balance_exhausted",
+            "insufficient_quota",
+            "exceeded your current quota",
+        )
+    )
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
@@ -36,14 +58,23 @@ class AIService:
         )
 
     def _complete(self, system: str, user: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.settings.ai_model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.settings.ai_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+            )
+        except RateLimitError as exc:
+            if _is_quota_error(exc):
+                raise AIQuotaExceededError(
+                    "El proveedor de IA no tiene créditos disponibles."
+                ) from exc
+            raise AIRateLimitError(
+                "El proveedor de IA está limitando temporalmente las solicitudes."
+            ) from exc
         content = response.choices[0].message.content
         if not content:
             raise ValueError("El modelo devolvió una respuesta vacía.")
