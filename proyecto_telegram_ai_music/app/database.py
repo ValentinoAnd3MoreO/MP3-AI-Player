@@ -1,5 +1,4 @@
 from bson import ObjectId
-from bson.errors import InvalidId
 from pymongo import MongoClient
 
 from app.config import Settings
@@ -28,28 +27,15 @@ class SongDatabase:
             "tags": 1,
             "bpm": 1,
             "duration_sec": 1,
-            "path": 1,
+            "sd_path": 1,
         }
         return list(self.songs.find(query, projection).limit(limit))
 
     def find_song_by_id(self, song_id: str) -> dict | None:
-        projection = {
-            "_id": 1,
-            "title": 1,
-            "artist": 1,
-            "album": 1,
-            "year": 1,
-            "path": 1,
-        }
-        try:
-            object_id = ObjectId(song_id)
-        except (InvalidId, TypeError):
-            object_id = None
-        if object_id is not None:
-            song = self.songs.find_one({"_id": object_id}, projection)
-            if song:
-                return song
-        return self.songs.find_one({"_id": song_id}, projection)
+        identifiers = [song_id]
+        if ObjectId.is_valid(song_id):
+            identifiers.append(ObjectId(song_id))
+        return self.songs.find_one({"_id": {"$in": identifiers}})
 
     def close(self) -> None:
         self.client.close()

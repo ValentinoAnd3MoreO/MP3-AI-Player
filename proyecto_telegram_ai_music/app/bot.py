@@ -24,7 +24,9 @@ from app.ai_service import (
 )
 from app.config import Settings
 from app.database import SongDatabase
+from app.device_client import DeviceClient, PlayerNotConfiguredError
 from app.recommender import Recommender
+from app.sd_path import parse_sd_path
 
 logger = logging.getLogger(__name__)
 _RECOMMENDATION_REQUEST = re.compile(
@@ -39,17 +41,9 @@ _MUSIC_WANT_REQUEST = re.compile(
     re.IGNORECASE,
 )
 _PLAYBACK_REQUEST = re.compile(
-    r"\b(reproductor|reprod\w*|"
-    r"(?:quiero|quisiera|me gustaría)\s+(?:escuchar|oir|oír|poner)\b|"
-    r"(?:pon(?:me|eme)?|poner(?:me)?)\s+(?:(?:esa|esta|la|el)\s+)?"
-    r"(?:canción|tema|música)|"
-    r"(?:play|toca)\s+(?:(?:esa|esta|la|el)\s+)?(?:canción|tema|song)|"
-    r"me gustaría que me la reproduzcas)\b",
-    re.IGNORECASE,
-)
-_MUSIC_PREFERENCE_REQUEST = re.compile(
-    r"\b(me gusta(?:n)?(?: más)?|mi favorito es|soy fan de)\s+"
-    r"(?P<artist>[^,.!?;:\n]{2,80})",
+    r"\b(reproductor|reprodu\w*|"
+    r"(?:pon(?:me|eme)?|ponerme)\s+(?:esa\s+)?(?:canción|tema|música)|"
+    r"(?:play|toca)\s+(?:esa\s+)?(?:canción|tema|song))\b",
     re.IGNORECASE,
 )
 _CHAT_WEB_LOOKUP_REQUEST = re.compile(
@@ -82,8 +76,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "¡Hola! Puedo conversar sobre música y también buscar canciones en tu "
         "biblioteca. Por ejemplo: «¿Qué hace especial a Prince?» o "
-        "«poneme hits movidos de los 80». Si hay un MP3 local, toca el botón ▶ "
-        "para mandarlo al ESP32. Usa /reset para borrar el contexto."
+        "«poneme hits movidos de los 80». Si la canción está mapeada en la "
+        "microSD y el ESP32 está conectado, también verás un botón para reproducirla. "
+        "Usa /reset para borrar el contexto."
     )
 
 
@@ -92,8 +87,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Escribe lo que quieres escuchar. También puedes usar /buscar seguido "
         "de una petición, por ejemplo /buscar rock de los 90. También puedes "
         "preguntarme sobre artistas, canciones, géneros e historia de la música. "
-        "Las canciones con archivo local muestran un botón ▶ para reproducir "
-        "en el ESP32. Usa /reset para iniciar una conversación nueva."
+        "Las recomendaciones con una ruta SD válida tendrán un botón de reproducción. "
+        "Usa /reset para iniciar una conversación nueva."
     )
 
 
@@ -110,10 +105,13 @@ async def recommend_text(
     request_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     recommender: Recommender = context.application.bot_data["recommender"]
+    history = context.application.user_data[update.effective_user.id].get(
+        "music_history", []
+    )
     await update.message.chat.send_action("typing")
     try:
         songs, web_failed = await asyncio.to_thread(
-            recommender.recommend, request_text
+            recommender.recommend, request_text, history
         )
     except AIQuotaExceededError:
         logger.warning("La cuenta del proveedor de IA no tiene créditos disponibles.")
@@ -146,29 +144,22 @@ async def recommend_text(
         _remember_exchange(context, update, request_text, "No se encontraron canciones.")
         return
 
-    message = "\n".join(_format_song(song, index) for index, song in enumerate(songs, 1))
-    user_data = context.application.user_data[update.effective_user.id]
-    user_data["last_recommendations"] = [str(song["_id"]) for song in songs]
-    markup = _play_markup(songs, context, update.effective_user.id)
-    if markup is not None:
-        message += "\n\nToca una canción para enviarla al ESP32."
-    elif not any(
-        context.application.bot_data["music"].has_audio(song) for song in songs
-    ):
-        message += (
-            "\n\nTodavía no hay MP3 locales para estas canciones. Copia tus archivos "
-            "a la carpeta music y ejecuta `python -m scripts.index_music`."
-        )
-    elif not context.application.bot_data["device_bridge"].settings.device_enabled:
-        message += (
-            "\n\nHay MP3 locales, pero la reproducción ESP32 todavía no está "
-            "habilitada en la configuración."
-        )
+    message = "\n".join(
+        _format_song(song, index) for index, song in enumerate(songs, 1)
+    )
+    keyboard = _play_keyboard(songs, context, update.effective_user.id)
+    has_sd_paths = any(parse_sd_path(song.get("sd_path")) for song in songs)
+    if keyboard:
+        message += "\n\nToca una canción para reproducirla en el ESP32:"
+    elif not has_sd_paths:
+        message += "\n\nEstas canciones aún no tienen una ruta válida en la microSD."
+    else:
+        message += "\n\nEl reproductor todavía no está habilitado."
     if web_failed:
         message += "\n\n<i>La búsqueda web no estuvo disponible; recomendé usando "
         message += "solo tu biblioteca local.</i>"
     await update.message.reply_text(
-        message, parse_mode=ParseMode.HTML, reply_markup=markup
+        message, parse_mode=ParseMode.HTML, reply_markup=keyboard
     )
     plain_list = "\n".join(
         f"{index}. {song.get('title', 'Sin título')} — "
@@ -176,6 +167,80 @@ async def recommend_text(
         for index, song in enumerate(songs, 1)
     )
     _remember_exchange(context, update, request_text, plain_list)
+
+
+def _play_keyboard(
+    songs: list[dict], context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> InlineKeyboardMarkup | None:
+    rows = []
+    user_data = context.application.user_data[user_id]
+    pending = user_data.setdefault("pending_play", {})
+    pending.clear()
+    if not context.application.bot_data["player_settings"].player_enabled:
+        return None
+    for song in songs:
+        if not parse_sd_path(song.get("sd_path")):
+            continue
+        token = uuid.uuid4().hex[:16]
+        pending[token] = str(song["_id"])
+        label = f"▶ {song.get('title', 'Reproducir')} — {song.get('artist', '')}"
+        rows.append(
+            [InlineKeyboardButton(label[:60], callback_data=f"play:{token}")]
+        )
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def play_song_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    token = query.data.partition(":")[2]
+    pending = context.user_data.get("pending_play", {})
+    song_id = pending.pop(token, None)
+    if not song_id:
+        await query.answer(
+            "Este botón venció. Pide la recomendación otra vez.", show_alert=True
+        )
+        return
+
+    await query.answer("Enviando la orden al reproductor…")
+    settings: Settings = context.application.bot_data["player_settings"]
+    if not settings.player_enabled:
+        await query.message.reply_text(
+            "El reproductor ESP32 no está habilitado. Configura PLAYER_ENABLED."
+        )
+        return
+
+    database: SongDatabase = context.application.bot_data["database"]
+    song = await asyncio.to_thread(database.find_song_by_id, song_id)
+    if not song or not parse_sd_path(song.get("sd_path")):
+        await query.message.reply_text(
+            "La canción ya no tiene una ruta SD válida en la biblioteca."
+        )
+        return
+
+    device: DeviceClient = context.application.bot_data["device"]
+    try:
+        await asyncio.to_thread(device.play, song["sd_path"])
+    except PlayerNotConfiguredError:
+        await query.message.reply_text("Falta configurar la conexión con el ESP32.")
+        return
+    except requests.exceptions.RequestException:
+        logger.exception("No se pudo enviar la orden al ESP32")
+        await query.message.reply_text(
+            "No pude contactar el ESP32. Revisa que esté encendido en la misma red."
+        )
+        return
+    except Exception:
+        logger.exception("El ESP32 rechazó la orden de reproducción")
+        await query.message.reply_text(
+            "El reproductor rechazó la orden. Comprueba la ruta SD y el DFPlayer."
+        )
+        return
+
+    await query.message.reply_text(
+        f"Orden enviada al ESP32: {song.get('title', 'la canción')}."
+    )
 
 
 def _remember_exchange(
@@ -190,144 +255,6 @@ def _remember_exchange(
         ]
     )
     del history[:-12]
-
-
-def _play_markup(
-    songs: list[dict],
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-) -> InlineKeyboardMarkup | None:
-    bridge = context.application.bot_data["device_bridge"]
-    if not bridge.settings.device_enabled:
-        return None
-
-    user_data = context.application.user_data[user_id]
-    play_tokens = user_data.setdefault("play_tokens", {})
-    play_tokens.clear()
-    rows = []
-    for song in songs:
-        if not bridge.has_audio(song):
-            continue
-        token = uuid.uuid4().hex[:20]
-        play_tokens[token] = str(song["_id"])
-        label = f"▶ {song.get('title') or 'Reproducir'}"
-        if len(label) > 60:
-            label = label[:57] + "..."
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    label,
-                    callback_data=f"play:{token}",
-                )
-            ]
-        )
-    return InlineKeyboardMarkup(rows) if rows else None
-
-
-async def play_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    query = update.callback_query
-    await query.answer()
-    token = query.data.partition(":")[2]
-    song_id = context.application.user_data[query.from_user.id].get(
-        "play_tokens", {}
-    ).get(token)
-    if not song_id:
-        await query.message.reply_text(
-            "Ese botón venció. Pídeme otra recomendación para generar uno nuevo."
-        )
-        return
-
-    database: SongDatabase = context.application.bot_data["database"]
-    bridge = context.application.bot_data["device_bridge"]
-    song = database.find_song_by_id(song_id)
-    if not song:
-        await query.message.reply_text("No encuentro esa canción en MongoDB.")
-        return
-    try:
-        await bridge.enqueue(song)
-    except (RuntimeError, FileNotFoundError) as exc:
-        await query.message.reply_text(str(exc))
-        return
-    await query.message.reply_text(
-        f"Envié <b>{html.escape(str(song.get('title') or 'la canción'))}</b> "
-        "a la cola del ESP32.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def playback_request(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, message: str
-) -> None:
-    database: SongDatabase = context.application.bot_data["database"]
-    music = context.application.bot_data["music"]
-    ai: AIService = context.application.bot_data["ai"]
-    bridge = context.application.bot_data["device_bridge"]
-    if not bridge.settings.device_enabled:
-        await update.message.reply_text(
-            "La conexión con el ESP32 todavía no está habilitada. Configura "
-            "DEVICE_ENABLED, DEVICE_API_TOKEN y DEVICE_PUBLIC_URL en `.env`, "
-            "y reinicia el bot."
-        )
-        return
-    available = [
-        song
-        for song in database.find_candidates(
-            {"path": {"$exists": True, "$ne": ""}}, limit=500
-        )
-        if music.has_audio(song)
-    ]
-    if not available:
-        await update.message.reply_text(
-            "Todavía no hay archivos MP3 indexados en la carpeta music. Copia allí "
-            "tus canciones y ejecuta `python -m scripts.index_music`; luego puedo "
-            "enviarlas al ESP32."
-        )
-        return
-
-    history = context.application.user_data[update.effective_user.id].get(
-        "music_history", []
-    )
-    try:
-        song_id = await asyncio.to_thread(
-            ai.choose_song_for_playback, message, history, available
-        )
-    except AIQuotaExceededError:
-        await update.message.reply_text(
-            "La cuenta de OpenAI se quedó sin créditos o alcanzó su cuota. "
-            "Revisa la facturación de la API e inténtalo otra vez."
-        )
-        return
-    except AIRateLimitError:
-        await update.message.reply_text(
-            "OpenAI está limitando temporalmente las solicitudes. Inténtalo en un momento."
-        )
-        return
-    except Exception:
-        logger.exception("No se pudo identificar la canción a reproducir")
-        await update.message.reply_text(
-            "No pude identificar qué canción quieres reproducir. Dime el título "
-            "o el artista e inténtalo de nuevo."
-        )
-        return
-
-    song = next((item for item in available if str(item["_id"]) == song_id), None)
-    if not song:
-        await update.message.reply_text(
-            "No pude identificar con seguridad la canción. Dime el título y el artista."
-        )
-        return
-    try:
-        await bridge.enqueue(song)
-    except (RuntimeError, FileNotFoundError) as exc:
-        await update.message.reply_text(str(exc))
-        return
-    await update.message.reply_text(
-        f"¡Dale! Envié <b>{html.escape(str(song.get('title') or 'la canción'))}</b> "
-        "a la cola del ESP32.",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 async def chat_message(
@@ -379,12 +306,7 @@ async def chat_message(
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message.text
     if _PLAYBACK_REQUEST.search(message):
-        await playback_request(update, context, message)
-    elif _MUSIC_PREFERENCE_REQUEST.search(message):
-        artist = _MUSIC_PREFERENCE_REQUEST.search(message).group("artist").strip()
-        await recommend_text(
-            f"Recomiéndame canciones de {artist}", update, context
-        )
+        await recommend_text(message, update, context)
     elif (
         _RECOMMENDATION_REQUEST.search(message)
         or _MUSIC_WANT_REQUEST.search(message)
@@ -404,31 +326,22 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def create_application(settings: Settings) -> Application:
     database = SongDatabase(settings)
-    from app.device_bridge import DeviceBridge
-    from app.music_library import MusicLibrary
-
-    music = MusicLibrary(settings)
-    bridge = DeviceBridge(settings, database, music)
     ai = AIService(settings)
     web = WebSearch(settings)
     recommender = Recommender(database, ai, web)
-    application = (
-        Application.builder()
-        .token(settings.telegram_bot_token)
-        .post_init(bridge.start)
-        .post_shutdown(bridge.stop)
-        .build()
-    )
+    application = Application.builder().token(settings.telegram_bot_token).build()
     application.bot_data["recommender"] = recommender
     application.bot_data["ai"] = ai
     application.bot_data["web"] = web
+    application.bot_data["device"] = DeviceClient(settings)
+    application.bot_data["player_settings"] = settings
     application.bot_data["database"] = database
-    application.bot_data["music"] = music
-    application.bot_data["device_bridge"] = bridge
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("reset", reset_chat))
     application.add_handler(CommandHandler("buscar", search_command))
-    application.add_handler(CallbackQueryHandler(play_callback, pattern=r"^play:"))
+    application.add_handler(
+        CallbackQueryHandler(play_song_callback, pattern=r"^play:[0-9a-f]{16}$")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     return application

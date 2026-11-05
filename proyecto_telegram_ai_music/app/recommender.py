@@ -75,14 +75,17 @@ def _title_from_request(request_text: str) -> str | None:
 
 def _unique_songs(songs: list[dict]) -> list[dict]:
     unique = []
-    seen = set()
+    positions = {}
     for song in songs:
         title = str(song.get("title", "")).strip().casefold()
         artist = str(song.get("artist", "")).strip().casefold()
         identity = (title, artist) if title or artist else ("_id", str(song.get("_id")))
-        if identity in seen:
+        if identity in positions:
+            index = positions[identity]
+            if not unique[index].get("sd_path") and song.get("sd_path"):
+                unique[index] = song
             continue
-        seen.add(identity)
+        positions[identity] = len(unique)
         unique.append(song)
     return unique
 
@@ -93,8 +96,10 @@ class Recommender:
         self.ai = ai
         self.web = web
 
-    def recommend(self, request_text: str) -> tuple[list[dict], bool]:
-        filters = self.ai.extract_filters(request_text)
+    def recommend(
+        self, request_text: str, history: list[dict[str, str]] | None = None
+    ) -> tuple[list[dict], bool]:
+        filters = self.ai.extract_filters(request_text, history or [])
         candidates = self.database.find_candidates(build_mongo_query(filters), limit=100)
         if not candidates:
             relaxed_filters = {

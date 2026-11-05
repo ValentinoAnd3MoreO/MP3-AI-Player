@@ -2,6 +2,4 @@
 .venv/
 __pycache__/
 *.py[cod]
-esp32_firmware/config.py
-music/*
-!music/.gitkeep
+/esp32_firmware/config.py

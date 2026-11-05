@@ -1,13 +1,14 @@
 # MP3 AI Player: Telegram, MongoDB e IA configurable
 
-Prototipo ejecutable de un bot de Telegram que conversa sobre música y también busca canciones en MongoDB local. En las recomendaciones, la IA ordena candidatos reales de la biblioteca; no inventa canciones disponibles.
+Prototipo ejecutable de un bot de Telegram que conversa sobre música, recomienda temas desde MongoDB y ofrece botones para reproducir los MP3 que estén mapeados a la microSD de un DFPlayer Mini conectado a un ESP32.
 
 Todo este prototipo vive en esta carpeta; no modifica el código de las otras carpetas del repositorio.
 
 ## Qué hace
 
 - Recibe texto y el comando `/buscar` en Telegram.
-- Reconoce pedidos de reproducción y aclara que todavía falta conectar el reproductor, en vez de responder con una recomendación distinta.
+- Añade botones explícitos de reproducción a canciones recomendadas que tengan una ruta `sd_path` válida en MongoDB.
+- Envía al ESP32 únicamente la ruta obtenida de MongoDB y validada; la IA no genera comandos ni rutas para el hardware.
 - Responde como asistente conversacional sobre artistas, canciones, géneros e historia musical, con hasta seis intercambios recientes de contexto por usuario. Usa `/reset` para iniciar de nuevo. Los saludos no activan Tavily; la búsqueda web en el chat queda para preguntas que piden explícitamente información actual o noticias.
 - Pide a un modelo configurable que convierta la consulta a filtros sencillos: artista, género, década, mood y palabras clave.
 - Construye una consulta MongoDB segura a partir de esos campos (no ejecuta consultas MongoDB generadas por el modelo).
@@ -17,7 +18,7 @@ Todo este prototipo vive en esta carpeta; no modifica el código de las otras ca
 - Si la búsqueda web no está disponible, registra el problema y continúa usando la biblioteca local. Si falla el proveedor de IA, el bot informa que no pudo completar la búsqueda.
 - Si OpenAI indica que se agotaron los créditos/cuota, el bot muestra un aviso específico y un enlace a facturación; los límites temporales de solicitudes se notifican por separado.
 
-La reproducción al ESP32 está disponible cuando configures tus MP3, el puente de red y el firmware VS1053 descritos abajo.
+Las canciones no se transmiten desde Telegram ni desde OpenAI: el ESP32 ordena al DFPlayer Mini que reproduzca el archivo que ya existe en la microSD.
 
 ## Requisitos
 
@@ -80,11 +81,13 @@ La aplicación usa la base `mp3_ai_player` y la colección `songs` por defecto. 
   "tags": ["hit", "80s", "classic"],
   "bpm": 168,
   "duration_sec": 227,
-  "path": "80s/TakeOnMe.mp3"
+  "sd_path": "/01/001.mp3",
+  "dfplayer_folder": 1,
+  "dfplayer_track": 1
 }
 ```
 
-El documento puede tener un `_id` generado por MongoDB si no necesitas asignarlo tú. `year` o `decade` sirven para filtrar por época. `genre`, `mood` y `tags` pueden ser una cadena o una lista de cadenas. `path` es relativo a la carpeta `MUSIC_DIR` y no se expone al modelo.
+El documento puede tener un `_id` generado por MongoDB si no necesitas asignarlo tú. `year` o `decade` sirven para filtrar por época. `genre`, `mood` y `tags` pueden ser una cadena o una lista de cadenas. `sd_path` es la ruta relativa al contenido de la microSD y no una ruta del disco del PC.
 
 Carga los documentos en MongoDB con tu herramienta habitual, por ejemplo `mongoimport` desde un archivo JSON, o con una interfaz como MongoDB Compass. El esquema de datos real debe incluir metadatos suficientes para que las consultas por cantante, década y estilo encuentren coincidencias.
 
@@ -108,58 +111,45 @@ python -m scripts.seed_alternative_rock
 
 La carga es idempotente y no borra otras canciones. Purple Rain conserva sus metadatos de rock/pop-rock (no se etiqueta como rock alternativo). Los archivos de audio no se copian: el catálogo contiene metadatos.
 
-## Reproducir en ESP32 con VS1053
+### Preparar e indexar la microSD
 
-La IA no reproduce el audio por sí sola. La computadora ejecuta el bot, busca el MP3 en `music`, y lo transmite por la red local al ESP32. El VS1053 decodifica el MP3 y entrega audio al amplificador/auriculares conectados a su salida. El ESP32 y la computadora deben estar en la misma red Wi-Fi.
+El DFPlayer Mini no recibe rutas arbitrarias del PC. Para este proyecto, organiza la tarjeta en FAT32 usando carpetas numéricas `01` a `99` y MP3 numerados `001.mp3` a `255.mp3` dentro de cada carpeta:
 
-### Añadir e indexar tus MP3
-
-1. Copia archivos `.mp3` a `music` (también se admiten subcarpetas).
-2. Es recomendable que los MP3 tengan etiquetas ID3 de título y artista.
-3. Desde esta carpeta ejecuta:
-
-   ```powershell
-   python -m scripts.index_music
-   ```
-
-El indexador guarda o actualiza los metadatos y la ruta relativa en MongoDB. Los archivos permanecen en la computadora; no se copian a MongoDB ni se suben a OpenAI. Sin archivos locales no se muestran botones de reproducción.
-
-### Configurar el puente del servidor
-
-En `.env`, determina la IP local de la computadora con `ipconfig`. Configura:
-
-```env
-MUSIC_DIR=music
-DEVICE_ENABLED=true
-DEVICE_API_TOKEN=un_token_aleatorio_largo_compartido_con_el_esp32
-DEVICE_HOST=0.0.0.0
-DEVICE_PORT=8765
-DEVICE_PUBLIC_URL=http://192.168.1.100:8765
+```text
+microSD/
+├── 01/
+│   ├── 001.mp3
+│   ├── 002.mp3
+│   └── ...
+└── 02/
+    └── 001.mp3
 ```
 
-Reemplaza `192.168.1.100` por la IPv4 de la PC en tu red. Genera un token aleatorio (por ejemplo, con `python -c "import secrets; print(secrets.token_urlsafe(32))"`), ponlo en `.env` y en `esp32_firmware/config.py`. No compartas ni subas ese token. Si Windows Firewall pregunta, permite el puerto TCP 8765 únicamente en la red privada/local. Reinicia `run_bot.py` después de cambiar `.env`.
+Los archivos deben tener etiquetas ID3 con al menos título y artista. Conecta la tarjeta al PC y ejecuta el indexador apuntando a su letra (ajusta `E:\`):
 
-### Preparar ESP32 y VS1053
+```powershell
+python -m scripts.index_sd_card --sd-root E:\
+```
 
-El firmware de ejemplo está en `esp32_firmware`. Con un ESP32 DevKit típico, conecta el VS1053 por SPI:
+El indexador asocia cada MP3 a la canción existente por sus etiquetas ID3 y agrega `sd_path`, `dfplayer_folder` y `dfplayer_track`. Si no encuentra una canción equivalente, la crea en MongoDB. Omite rutas/nombres incompatibles o archivos sin etiquetas legibles. No copia ni renombra archivos.
 
-| VS1053 | ESP32 DevKit predeterminado |
-|---|---:|
-| SCK | GPIO 18 |
-| SI / MOSI | GPIO 23 |
-| SO / MISO | GPIO 19 |
-| XCS | GPIO 5 |
-| XDCS | GPIO 16 |
-| DREQ | GPIO 4 |
-| XRST / RESET | GPIO 17 |
-| GND | GND |
-| VCC | Según el módulo VS1053; verifica su documentación antes de alimentar |
+### Configurar el ESP32 y DFPlayer Mini
 
-Conecta la salida de audio del módulo al amplificador o salida adecuada para tus auriculares/parlante. No conectes un parlante pasivo directamente al ESP32. Los números GPIO son configurables y pueden variar según la placa; confirma el pinout del hardware real.
+1. Instala MicroPython en el ESP32 y copia `esp32_firmware/main.py`, `esp32_firmware/dfplayer.py`, `esp32_firmware/protocol.py` y una copia de `esp32_firmware/config.py.example` renombrada a `config.py`.
+2. Completa el Wi-Fi y genera un token aleatorio de al menos 24 caracteres en `config.py`.
+3. Cableado de ejemplo para un ESP32 DevKit: GPIO17 (TX) al RX del DFPlayer (se recomienda una resistencia de 1 kΩ en serie); GPIO16 (RX) al TX del DFPlayer; GND común y alimentación estable de 5 V al módulo. Conecta el parlante a SPK1/SPK2, no entre una salida del módulo y GND. Confirma los pines/voltaje de tu placa antes de alimentar.
+4. Copia los archivos MP3 y conserva exactamente la estructura numérica de carpetas/nombres. Expulsa la tarjeta con seguridad, insértala en el DFPlayer y reinicia el ESP32.
+5. En `.env`, establece la IP que el ESP32 muestra en su consola serie, el mismo token y habilita el reproductor:
 
-Instala MicroPython en el ESP32 y copia `main.py`, `vs1053.py` y `config.py.example` al dispositivo; crea allí `config.py` con esos valores. Completa Wi-Fi, IP de la PC, puerto y el mismo token secreto. La placa debe alcanzar `DEVICE_PUBLIC_URL` por la red local.
+```env
+PLAYER_ENABLED=true
+ESP32_BASE_URL=http://192.168.1.50:8080
+ESP32_API_TOKEN=el_mismo_token_de_config_py
+```
 
-Al pedir recomendaciones, el bot adjuntará botones `▶` a las canciones que tengan un MP3 local indexado. Al tocar un botón, el puente encola la selección y el ESP32 consulta la orden y transmite el archivo. También puedes pedir que reproduzca la canción mencionada en la conversación, siempre que esté entre los MP3 locales indexados.
+El PC del bot y el ESP32 deben poder comunicarse en la misma red local. El endpoint solo acepta órdenes con el token Bearer configurado. No expongas el puerto del ESP32 a Internet.
+
+Luego reinicia el bot, indexa la tarjeta y pide una canción. El bot ofrece un botón **Reproducir** para los resultados que tienen `sd_path`; la reproducción ocurre solo cuando lo pulsas. Las canciones de catálogo de prueba no tienen MP3 ni ruta SD hasta que indexas audio real.
 
 ## Ejecutar
 
@@ -174,6 +164,7 @@ En Telegram prueba:
 - `dame canciones movidas`
 - `buenos hits de los 80`
 - `canciones de Queen`
+- `me gustaría que me reproduzcas esa canción` (resuelve referencias recientes y ofrece el botón si el tema está indexado)
 - `/buscar rock argentino de los 90`
 
 El bot también ofrece `/start` y `/help`. Si no hay resultados, comprueba los metadatos de la colección, el nombre de la base y el de la colección.
@@ -199,21 +190,19 @@ proyecto_telegram_ai_music/
 │   ├── bot.py
 │   ├── config.py
 │   ├── database.py
+│   ├── device_client.py
 │   ├── recommender.py
-│   ├── device_bridge.py
-│   └── music_library.py
-├── scripts/
-│   ├── index_music.py
-│   ├── seed_80s.py
-│   └── seed_alternative_rock.py
+│   └── sd_path.py
 ├── esp32_firmware/
 │   ├── config.py.example
+│   ├── dfplayer.py
 │   ├── main.py
-│   └── vs1053.py
-├── music/
-│   └── (tus archivos MP3; no se suben a Git)
+│   └── protocol.py
+├── scripts/
+│   ├── index_sd_card.py
+│   ├── seed_80s.py
+│   └── seed_alternative_rock.py
 └── tests/
-    ├── test_device_bridge.py
     └── test_recommender.py
 ```
 
@@ -222,7 +211,5 @@ proyecto_telegram_ai_music/
 - La calidad depende de los metadatos disponibles en la biblioteca local; la IA no analiza el audio ni calcula BPM.
 - La consulta web es optativa y requiere una cuenta/clave de Tavily. El modelo no obtiene acceso general a Internet por sí mismo.
 - El historial conversacional se mantiene en memoria del proceso y se pierde al reiniciar el bot; no se guarda en MongoDB.
-- La reproducción requiere MP3 locales con metadatos, ESP32 configurado y un VS1053 conectado; el firmware de ejemplo necesita probarse en el hardware concreto antes de usarlo.
-- El puente es HTTP para la red local. No lo expongas directamente a Internet; el token solo autentica dentro de la red confiable.
-- Este prototipo todavía no registra historial de reproducciones ni reportes; esos extras se pueden integrar después sobre la misma base.
+- Este prototipo todavía no registra historial de reproducción ni incluye `/reportes` o comandos específicos como `/top80`; esos extras del proyecto se pueden integrar después sobre la misma base.
 - Para un despliegue real, añade controles de acceso al bot, gestión segura de claves, límites de uso y pruebas de integración con una instancia de MongoDB.
