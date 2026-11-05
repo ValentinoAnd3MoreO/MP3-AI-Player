@@ -1,12 +1,14 @@
 # MP3 AI Player: Telegram, MongoDB e IA configurable
 
-Prototipo ejecutable de un bot de Telegram que interpreta pedidos musicales, busca candidatos en MongoDB local y deja que una IA los ordene. La recomendación final siempre se arma con canciones reales encontradas en la colección local.
+Prototipo ejecutable de un bot de Telegram que conversa sobre música y también busca canciones en MongoDB local. En las recomendaciones, la IA ordena candidatos reales de la biblioteca; no inventa canciones disponibles.
 
 Todo este prototipo vive en esta carpeta; no modifica el código de las otras carpetas del repositorio.
 
 ## Qué hace
 
 - Recibe texto y el comando `/buscar` en Telegram.
+- Reconoce pedidos de reproducción y aclara que todavía falta conectar el reproductor, en vez de responder con una recomendación distinta.
+- Responde como asistente conversacional sobre artistas, canciones, géneros e historia musical, con hasta seis intercambios recientes de contexto por usuario. Usa `/reset` para iniciar de nuevo. Los saludos no activan Tavily; la búsqueda web en el chat queda para preguntas que piden explícitamente información actual o noticias.
 - Pide a un modelo configurable que convierta la consulta a filtros sencillos: artista, género, década, mood y palabras clave.
 - Construye una consulta MongoDB segura a partir de esos campos (no ejecuta consultas MongoDB generadas por el modelo).
 - Busca canciones candidatas en la colección `songs`.
@@ -15,7 +17,7 @@ Todo este prototipo vive en esta carpeta; no modifica el código de las otras ca
 - Si la búsqueda web no está disponible, registra el problema y continúa usando la biblioteca local. Si falla el proveedor de IA, el bot informa que no pudo completar la búsqueda.
 - Si OpenAI indica que se agotaron los créditos/cuota, el bot muestra un aviso específico y un enlace a facturación; los límites temporales de solicitudes se notifican por separado.
 
-Este prototipo recomienda; todavía no reproduce ni envía archivos de audio.
+La reproducción al ESP32 está disponible cuando configures tus MP3, el puente de red y el firmware VS1053 descritos abajo.
 
 ## Requisitos
 
@@ -78,13 +80,86 @@ La aplicación usa la base `mp3_ai_player` y la colección `songs` por defecto. 
   "tags": ["hit", "80s", "classic"],
   "bpm": 168,
   "duration_sec": 227,
-  "path": "C:\\Musica\\TakeOnMe.mp3"
+  "path": "80s/TakeOnMe.mp3"
 }
 ```
 
-El documento puede tener un `_id` generado por MongoDB si no necesitas asignarlo tú. `year` o `decade` sirven para filtrar por época. `genre`, `mood` y `tags` pueden ser una cadena o una lista de cadenas. `path` queda disponible para integrar más adelante el reproductor, pero no se expone al modelo.
+El documento puede tener un `_id` generado por MongoDB si no necesitas asignarlo tú. `year` o `decade` sirven para filtrar por época. `genre`, `mood` y `tags` pueden ser una cadena o una lista de cadenas. `path` es relativo a la carpeta `MUSIC_DIR` y no se expone al modelo.
 
 Carga los documentos en MongoDB con tu herramienta habitual, por ejemplo `mongoimport` desde un archivo JSON, o con una interfaz como MongoDB Compass. El esquema de datos real debe incluir metadatos suficientes para que las consultas por cantante, década y estilo encuentren coincidencias.
+
+### Cargar catálogo de prueba de los 80
+
+El proyecto incluye un catálogo inicial de 100 canciones conocidas de los 80. Contiene metadatos solamente (no archivos MP3) y se carga sin borrar ni sobrescribir otros documentos:
+
+```powershell
+python -m scripts.seed_80s
+```
+
+El script usa la base y colección configuradas en `.env`; por defecto `110Music.songs` si así lo configuraste. Es idempotente: puedes ejecutarlo nuevamente y no insertará copias de los documentos del catálogo.
+
+### Cargar rock alternativo y Purple Rain
+
+Para sumar 53 temas de rock alternativo de los 80 y 90, además de asegurar **Purple Rain** de Prince en la colección:
+
+```powershell
+python -m scripts.seed_alternative_rock
+```
+
+La carga es idempotente y no borra otras canciones. Purple Rain conserva sus metadatos de rock/pop-rock (no se etiqueta como rock alternativo). Los archivos de audio no se copian: el catálogo contiene metadatos.
+
+## Reproducir en ESP32 con VS1053
+
+La IA no reproduce el audio por sí sola. La computadora ejecuta el bot, busca el MP3 en `music`, y lo transmite por la red local al ESP32. El VS1053 decodifica el MP3 y entrega audio al amplificador/auriculares conectados a su salida. El ESP32 y la computadora deben estar en la misma red Wi-Fi.
+
+### Añadir e indexar tus MP3
+
+1. Copia archivos `.mp3` a `music` (también se admiten subcarpetas).
+2. Es recomendable que los MP3 tengan etiquetas ID3 de título y artista.
+3. Desde esta carpeta ejecuta:
+
+   ```powershell
+   python -m scripts.index_music
+   ```
+
+El indexador guarda o actualiza los metadatos y la ruta relativa en MongoDB. Los archivos permanecen en la computadora; no se copian a MongoDB ni se suben a OpenAI. Sin archivos locales no se muestran botones de reproducción.
+
+### Configurar el puente del servidor
+
+En `.env`, determina la IP local de la computadora con `ipconfig`. Configura:
+
+```env
+MUSIC_DIR=music
+DEVICE_ENABLED=true
+DEVICE_API_TOKEN=un_token_aleatorio_largo_compartido_con_el_esp32
+DEVICE_HOST=0.0.0.0
+DEVICE_PORT=8765
+DEVICE_PUBLIC_URL=http://192.168.1.100:8765
+```
+
+Reemplaza `192.168.1.100` por la IPv4 de la PC en tu red. Genera un token aleatorio (por ejemplo, con `python -c "import secrets; print(secrets.token_urlsafe(32))"`), ponlo en `.env` y en `esp32_firmware/config.py`. No compartas ni subas ese token. Si Windows Firewall pregunta, permite el puerto TCP 8765 únicamente en la red privada/local. Reinicia `run_bot.py` después de cambiar `.env`.
+
+### Preparar ESP32 y VS1053
+
+El firmware de ejemplo está en `esp32_firmware`. Con un ESP32 DevKit típico, conecta el VS1053 por SPI:
+
+| VS1053 | ESP32 DevKit predeterminado |
+|---|---:|
+| SCK | GPIO 18 |
+| SI / MOSI | GPIO 23 |
+| SO / MISO | GPIO 19 |
+| XCS | GPIO 5 |
+| XDCS | GPIO 16 |
+| DREQ | GPIO 4 |
+| XRST / RESET | GPIO 17 |
+| GND | GND |
+| VCC | Según el módulo VS1053; verifica su documentación antes de alimentar |
+
+Conecta la salida de audio del módulo al amplificador o salida adecuada para tus auriculares/parlante. No conectes un parlante pasivo directamente al ESP32. Los números GPIO son configurables y pueden variar según la placa; confirma el pinout del hardware real.
+
+Instala MicroPython en el ESP32 y copia `main.py`, `vs1053.py` y `config.py.example` al dispositivo; crea allí `config.py` con esos valores. Completa Wi-Fi, IP de la PC, puerto y el mismo token secreto. La placa debe alcanzar `DEVICE_PUBLIC_URL` por la red local.
+
+Al pedir recomendaciones, el bot adjuntará botones `▶` a las canciones que tengan un MP3 local indexado. Al tocar un botón, el puente encola la selección y el ESP32 consulta la orden y transmite el archivo. También puedes pedir que reproduzca la canción mencionada en la conversación, siempre que esté entre los MP3 locales indexados.
 
 ## Ejecutar
 
@@ -124,8 +199,21 @@ proyecto_telegram_ai_music/
 │   ├── bot.py
 │   ├── config.py
 │   ├── database.py
-│   └── recommender.py
+│   ├── recommender.py
+│   ├── device_bridge.py
+│   └── music_library.py
+├── scripts/
+│   ├── index_music.py
+│   ├── seed_80s.py
+│   └── seed_alternative_rock.py
+├── esp32_firmware/
+│   ├── config.py.example
+│   ├── main.py
+│   └── vs1053.py
+├── music/
+│   └── (tus archivos MP3; no se suben a Git)
 └── tests/
+    ├── test_device_bridge.py
     └── test_recommender.py
 ```
 
@@ -133,5 +221,8 @@ proyecto_telegram_ai_music/
 
 - La calidad depende de los metadatos disponibles en la biblioteca local; la IA no analiza el audio ni calcula BPM.
 - La consulta web es optativa y requiere una cuenta/clave de Tavily. El modelo no obtiene acceso general a Internet por sí mismo.
-- Este prototipo no contiene `/reportes`, historial de reproducción, botones de audio ni comandos específicos como `/top80`; esos extras del proyecto se pueden integrar después sobre la misma base.
+- El historial conversacional se mantiene en memoria del proceso y se pierde al reiniciar el bot; no se guarda en MongoDB.
+- La reproducción requiere MP3 locales con metadatos, ESP32 configurado y un VS1053 conectado; el firmware de ejemplo necesita probarse en el hardware concreto antes de usarlo.
+- El puente es HTTP para la red local. No lo expongas directamente a Internet; el token solo autentica dentro de la red confiable.
+- Este prototipo todavía no registra historial de reproducciones ni reportes; esos extras se pueden integrar después sobre la misma base.
 - Para un despliegue real, añade controles de acceso al bot, gestión segura de claves, límites de uso y pruebas de integración con una instancia de MongoDB.

@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -27,9 +28,19 @@ class Settings:
     web_search_enabled: bool
     web_search_api_key: str
     web_search_max_results: int
+    music_dir: Path
+    device_enabled: bool
+    device_api_token: str
+    device_host: str
+    device_port: int
+    device_public_url: str
 
     @classmethod
     def from_env(cls) -> "Settings":
+        project_dir = Path(__file__).resolve().parents[1]
+        music_dir = Path(os.getenv("MUSIC_DIR", str(project_dir / "music"))).expanduser()
+        if not music_dir.is_absolute():
+            music_dir = project_dir / music_dir
         return cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             mongo_uri=os.getenv("MONGO_URI", "mongodb://localhost:27017"),
@@ -45,6 +56,12 @@ class Settings:
             web_search_max_results=max(
                 1, min(int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5")), 10)
             ),
+            music_dir=music_dir,
+            device_enabled=_env_bool("DEVICE_ENABLED"),
+            device_api_token=os.getenv("DEVICE_API_TOKEN", ""),
+            device_host=os.getenv("DEVICE_HOST", "0.0.0.0"),
+            device_port=int(os.getenv("DEVICE_PORT", "8765")),
+            device_public_url=os.getenv("DEVICE_PUBLIC_URL", "").rstrip("/"),
         )
 
     def validate(self) -> None:
@@ -55,5 +72,18 @@ class Settings:
             missing.append("AI_API_KEY")
         if self.web_search_enabled and not self.web_search_api_key:
             missing.append("WEB_SEARCH_API_KEY (requerida con WEB_SEARCH_ENABLED=true)")
+        if self.device_enabled:
+            if not self.device_api_token:
+                missing.append("DEVICE_API_TOKEN (requerida con DEVICE_ENABLED=true)")
+            if not self.device_public_url:
+                missing.append(
+                    "DEVICE_PUBLIC_URL (IP local del equipo en la red Wi-Fi)"
+                )
+            elif not self.device_public_url.startswith("http://"):
+                missing.append(
+                    "DEVICE_PUBLIC_URL debe empezar con http:// para el firmware MicroPython"
+                )
+            if not 1 <= self.device_port <= 65535:
+                missing.append("DEVICE_PORT debe estar entre 1 y 65535")
         if missing:
             raise ValueError("Faltan variables de entorno: " + ", ".join(missing))

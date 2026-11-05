@@ -1,0 +1,19 @@
+WIFI_SSID = "NOMBRE_DE_TU_WIFI"
+WIFI_PASSWORD = "CLAVE_DE_TU_WIFI"
+
+# IP local de la computadora que ejecuta run_bot.py
+SERVER_HOST = "192.168.1.100"
+SERVER_PORT = 8765
+DEVICE_API_TOKEN = "EL_MISMO_TOKEN_CONFIGURADO_EN_EL_SERVIDOR"
+
+# VS1053 SPI (ESP32 DevKit típico); confirmar etiquetas en tu placa.
+SPI_ID = 2
+PIN_SCK = 18
+PIN_MOSI = 23
+PIN_MISO = 19
+PIN_XCS = 5
+PIN_XDCS = 16
+PIN_DREQ = 4
+PIN_RESET = 17
+
+POLL_SECONDS = 3

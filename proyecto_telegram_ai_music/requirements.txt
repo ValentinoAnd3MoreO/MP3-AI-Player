@@ -1,3 +1,5 @@
+aiohttp>=3.9,<4
+mutagen>=1.47,<2
 openai>=1.30,<3
 pymongo>=4.7,<5
 python-dotenv>=1.0,<2
