@@ -15,6 +15,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from pymongo.errors import PyMongoError
 
 from app.ai_service import (
     AIQuotaExceededError,
@@ -31,8 +32,7 @@ from app.sd_path import parse_sd_path
 logger = logging.getLogger(__name__)
 _RECOMMENDATION_REQUEST = re.compile(
     r"\b(canciones?|temas?|hits?|recomiend\w*|suger\w*|"
-    r"dame|pon(?:me|eme)?|busco|buscar|escuch\w*|reproduc\w*|"
-    r"ten[eé]s|tienes|hay)\b",
+    r"dame|pon(?:me|eme)?|busco|buscar|escuch\w*|reproduc\w*)\b",
     re.IGNORECASE,
 )
 _MUSIC_WANT_REQUEST = re.compile(
@@ -44,6 +44,16 @@ _PLAYBACK_REQUEST = re.compile(
     r"\b(reproductor|reprodu\w*|"
     r"(?:pon(?:me|eme)?|ponerme)\s+(?:esa\s+)?(?:canción|tema|música)|"
     r"(?:play|toca)\s+(?:esa\s+)?(?:canción|tema|song))\b",
+    re.IGNORECASE,
+)
+_REPEAT_PLAYBACK_REQUEST = re.compile(
+    r"\b(?:otra\s+vez|de\s+nuevo|nuevamente|"
+    r"repetir(?:la|lo)?|la\s+misma\s+canci[oó]n)\b",
+    re.IGNORECASE,
+)
+_LIBRARY_AVAILABILITY_QUESTION = re.compile(
+    r"\b(?:la|lo|esa|ese|esta|este)\s+(?:ten[eé]s|tienes|tiene|hay|está|esta)\b"
+    r".{0,80}\b(?:escuchar\w*|reproduc\w*|o[ií]r|poner\w*)\b",
     re.IGNORECASE,
 )
 _CHAT_WEB_LOOKUP_REQUEST = re.compile(
@@ -88,16 +98,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "de una petición, por ejemplo /buscar rock de los 90. También puedes "
         "preguntarme sobre artistas, canciones, géneros e historia de la música. "
         "Las recomendaciones con una ruta SD válida tendrán un botón de reproducción. "
-        "Usa /reset para iniciar una conversación nueva."
+        "Usa /pausar y /reanudar para controlar el audio, y /reset para iniciar "
+        "una conversación nueva."
     )
+
+
+async def pause_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await _send_player_control(update, context, "pause")
+
+
+async def resume_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    await _send_player_control(update, context, "resume")
 
 
 async def reset_chat(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    context.application.user_data[update.effective_user.id].pop(
-        "music_history", None
-    )
+    user_data = context.application.user_data[update.effective_user.id]
+    user_data.pop("music_history", None)
+    user_data.pop("suggested_play_songs", None)
     await update.message.reply_text("Listo, empecemos una conversación nueva.")
 
 
@@ -190,6 +213,39 @@ def _play_keyboard(
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def _play_suggestion_keyboard(
+    song: dict, context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> InlineKeyboardMarkup | None:
+    if not context.application.bot_data["player_settings"].player_enabled:
+        return None
+    if not parse_sd_path(song.get("sd_path")):
+        return None
+
+    token = uuid.uuid4().hex[:16]
+    user_data = context.application.user_data[user_id]
+    suggested = user_data.setdefault("suggested_play_songs", set())
+    song_id = str(song["_id"])
+    if song_id in suggested:
+        return None
+    suggested.add(song_id)
+    pending = user_data.setdefault("pending_play", {})
+    pending[token] = str(song["_id"])
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Sí, reproducir", callback_data=f"play:{token}"),
+            InlineKeyboardButton("No, gracias", callback_data=f"dismiss:{token}"),
+        ]]
+    )
+
+
+def _player_control_keyboard(action: str = "pause") -> InlineKeyboardMarkup:
+    if action == "pause":
+        button = InlineKeyboardButton("⏸ Pausar", callback_data="control:pause")
+    else:
+        button = InlineKeyboardButton("▶ Reanudar", callback_data="control:resume")
+    return InlineKeyboardMarkup([[button]])
+
+
 async def play_song_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -239,8 +295,112 @@ async def play_song_callback(
         return
 
     await query.message.reply_text(
-        f"Orden enviada al ESP32: {song.get('title', 'la canción')}."
+        f"Orden enviada al ESP32: {song.get('title', 'la canción')}.",
+        reply_markup=_player_control_keyboard(),
     )
+    context.user_data["last_played_song_id"] = str(song["_id"])
+
+
+async def repeat_last_song(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    song_id = context.user_data.get("last_played_song_id")
+    if not song_id:
+        await update.message.reply_text(
+            "No tengo registrada la última canción reproducida (por ejemplo, "
+            "si el bot se reinició). Dime el título o artista y la busco."
+        )
+        return
+
+    database: SongDatabase = context.application.bot_data["database"]
+    try:
+        song = await asyncio.to_thread(database.find_song_by_id, song_id)
+    except PyMongoError:
+        logger.exception("No se pudo recuperar la última canción reproducida")
+        await update.message.reply_text(
+            "No pude consultar la biblioteca para recuperar la última canción."
+        )
+        return
+    if not song or not parse_sd_path(song.get("sd_path")):
+        await update.message.reply_text(
+            "La última canción ya no tiene una ruta válida en la microSD. "
+            "Dime el título y la vuelvo a buscar."
+        )
+        return
+
+    keyboard = _play_keyboard([song], context, update.effective_user.id)
+    await update.message.reply_text(
+        f"{_format_song(song, 1)}\n\n¿Quieres escucharla otra vez?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def dismiss_play_suggestion(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    token = query.data.partition(":")[2]
+    context.user_data.get("pending_play", {}).pop(token, None)
+    await query.answer("Entendido.")
+    await query.edit_message_reply_markup(reply_markup=None)
+
+
+async def _send_player_control(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str
+) -> None:
+    if update.callback_query:
+        await update.callback_query.answer("Enviando la orden…")
+
+    settings: Settings = context.application.bot_data["player_settings"]
+    if not settings.player_enabled:
+        await update.effective_message.reply_text(
+            "El reproductor ESP32 no está habilitado."
+        )
+        return
+
+    device: DeviceClient = context.application.bot_data["device"]
+    try:
+        await asyncio.to_thread(getattr(device, action))
+    except PlayerNotConfiguredError:
+        await update.effective_message.reply_text(
+            "Falta configurar la conexión con el ESP32."
+        )
+        return
+    except requests.exceptions.RequestException:
+        logger.exception("No se pudo enviar el control %s al ESP32", action)
+        await update.effective_message.reply_text(
+            "No pude contactar el ESP32. Revisa que esté encendido en la misma red."
+        )
+        return
+    except Exception:
+        logger.exception("El ESP32 rechazó el control %s", action)
+        await update.effective_message.reply_text(
+            "El reproductor rechazó la orden. Comprueba el ESP32 y el DFPlayer."
+        )
+        return
+
+    if update.callback_query:
+        query = update.callback_query
+        await query.edit_message_reply_markup(
+            reply_markup=_player_control_keyboard(
+                "resume" if action == "pause" else "pause"
+            )
+        )
+    else:
+        label = (
+            "Pausa enviada al ESP32."
+            if action == "pause"
+            else "Reanudación enviada al ESP32."
+        )
+        await update.effective_message.reply_text(label)
+
+
+async def player_control_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    action = update.callback_query.data.partition(":")[2]
+    await _send_player_control(update, context, action)
 
 
 def _remember_exchange(
@@ -267,7 +427,7 @@ async def chat_message(
     )
     await update.message.chat.send_action("typing")
 
-    def answer() -> str:
+    def answer() -> tuple[str, dict[str, str] | None]:
         web_context = ""
         if _needs_chat_web_lookup(message):
             try:
@@ -277,7 +437,7 @@ async def chat_message(
         return ai.chat_music(message, history, web_context)
 
     try:
-        response = await asyncio.to_thread(answer)
+        response, song_reference = await asyncio.to_thread(answer)
     except AIQuotaExceededError:
         await update.message.reply_text(
             "La cuenta de OpenAI se quedó sin créditos o alcanzó su cuota. "
@@ -300,12 +460,58 @@ async def chat_message(
         return
 
     await update.message.reply_text(response)
+    if context.application.bot_data["player_settings"].player_enabled:
+        database: SongDatabase = context.application.bot_data["database"]
+        user_messages = [
+            item["content"]
+            for item in history
+            if item.get("role") == "user" and isinstance(item.get("content"), str)
+        ][-5:]
+        user_messages.append(message)
+        try:
+            song = None
+            if song_reference:
+                recent_user_text = " ".join(user_messages).casefold()
+                if (
+                    song_reference["title"].casefold() in recent_user_text
+                    and song_reference["artist"].casefold() in recent_user_text
+                ):
+                    song = await asyncio.to_thread(
+                        database.find_playable_song_by_title_artist,
+                        song_reference["title"],
+                        song_reference["artist"],
+                    )
+            if not song:
+                song = await asyncio.to_thread(
+                    database.find_playable_song_mentioned_in, user_messages
+                )
+        except PyMongoError:
+            logger.exception("No se pudo comprobar la canción en la biblioteca")
+            await update.message.reply_text(
+                "No pude consultar ahora si esa canción está disponible para reproducir."
+            )
+        else:
+            if song:
+                keyboard = _play_suggestion_keyboard(
+                    song, context, update.effective_user.id
+                )
+                if keyboard:
+                    await update.message.reply_text(
+                        f"Veo que «{song.get('title')}» de "
+                        f"{song.get('artist')} está lista en tu microSD. "
+                        "¿Quieres que la reproduzca?",
+                        reply_markup=keyboard,
+                    )
     _remember_exchange(context, update, message, response)
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message.text
-    if _PLAYBACK_REQUEST.search(message):
+    if _REPEAT_PLAYBACK_REQUEST.search(message):
+        await repeat_last_song(update, context)
+    elif _LIBRARY_AVAILABILITY_QUESTION.search(message):
+        await chat_message(update, context, message)
+    elif _PLAYBACK_REQUEST.search(message):
         await recommend_text(message, update, context)
     elif (
         _RECOMMENDATION_REQUEST.search(message)
@@ -340,8 +546,18 @@ def create_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("reset", reset_chat))
     application.add_handler(CommandHandler("buscar", search_command))
+    application.add_handler(CommandHandler("pausar", pause_command))
+    application.add_handler(CommandHandler("reanudar", resume_command))
     application.add_handler(
         CallbackQueryHandler(play_song_callback, pattern=r"^play:[0-9a-f]{16}$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            dismiss_play_suggestion, pattern=r"^dismiss:[0-9a-f]{16}$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(player_control_callback, pattern=r"^control:(pause|resume)$")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     return application

@@ -8,6 +8,9 @@ Todo este prototipo vive en esta carpeta; no modifica el código de las otras ca
 
 - Recibe texto y el comando `/buscar` en Telegram.
 - Añade botones explícitos de reproducción a canciones recomendadas que tengan una ruta `sd_path` válida en MongoDB.
+- Después de hablar de una canción concreta, pregunta si quieres reproducirla cuando exista en la biblioteca con una ruta SD válida.
+- Incluye controles para pausar y reanudar la reproducción desde Telegram (`/pausar`, `/reanudar` o el botón debajo de la confirmación de reproducción).
+- Recuerda la última canción reproducida durante la sesión del bot; “otra vez” ofrece reproducirla de nuevo. Si el bot se reinició y perdió ese contexto, pide el título en vez de adivinar.
 - Envía al ESP32 únicamente la ruta obtenida de MongoDB y validada; la IA no genera comandos ni rutas para el hardware.
 - Responde como asistente conversacional sobre artistas, canciones, géneros e historia musical, con hasta seis intercambios recientes de contexto por usuario. Usa `/reset` para iniciar de nuevo. Los saludos no activan Tavily; la búsqueda web en el chat queda para preguntas que piden explícitamente información actual o noticias.
 - Pide a un modelo configurable que convierta la consulta a filtros sencillos: artista, género, década, mood y palabras clave.
@@ -137,7 +140,7 @@ El indexador asocia cada MP3 a la canción existente por sus etiquetas ID3 y agr
 
 1. Instala MicroPython en el ESP32 y copia `esp32_firmware/main.py`, `esp32_firmware/dfplayer.py`, `esp32_firmware/protocol.py` y una copia de `esp32_firmware/config.py.example` renombrada a `config.py`.
 2. Completa el Wi-Fi y genera un token aleatorio de al menos 24 caracteres en `config.py`.
-3. Cableado de ejemplo para un ESP32 DevKit: GPIO17 (TX) al RX del DFPlayer (se recomienda una resistencia de 1 kΩ en serie); GPIO16 (RX) al TX del DFPlayer; GND común y alimentación estable de 5 V al módulo. Conecta el parlante a SPK1/SPK2, no entre una salida del módulo y GND. Confirma los pines/voltaje de tu placa antes de alimentar.
+3. Cableado de ejemplo para un ESP32 DevKit: GPIO17 (TX) al RX del DFPlayer (se recomienda una resistencia de 1 kΩ en serie); GPIO16 (RX) al TX del DFPlayer; GND común y alimentación estable de 5 V a VCC. El DFPlayer se enciende al recibir alimentación; el firmware lo inicializa al arrancar y no empieza a reproducir hasta recibir una orden. Deja IO_1, IO_2 y ADKEY desconectados; no los unas a GND para encender el módulo. Conecta el parlante a SPK1/SPK2, no entre una salida del módulo y GND. Confirma los pines/voltaje de tu placa antes de alimentar.
 4. Copia los archivos MP3 y conserva exactamente la estructura numérica de carpetas/nombres. Expulsa la tarjeta con seguridad, insértala en el DFPlayer y reinicia el ESP32.
 5. En `.env`, establece la IP que el ESP32 muestra en su consola serie, el mismo token y habilita el reproductor:
 
@@ -151,7 +154,15 @@ El PC del bot y el ESP32 deben poder comunicarse en la misma red local. El endpo
 
 Luego reinicia el bot, indexa la tarjeta y pide una canción. El bot ofrece un botón **Reproducir** para los resultados que tienen `sd_path`; la reproducción ocurre solo cuando lo pulsas. Las canciones de catálogo de prueba no tienen MP3 ni ruta SD hasta que indexas audio real.
 
-Al pulsar reproducir, la consola serie del ESP32 muestra la respuesta UART del DFPlayer o indica que no hubo respuesta. La aceptación HTTP del ESP32 solo confirma que recibió la solicitud de red; no garantiza que el módulo haya empezado a reproducir.
+Al actualizar el firmware del ESP32, copia de nuevo tanto `main.py` como `dfplayer.py` (además de los otros archivos si cambiaron). Al pulsar reproducir, la consola serie muestra la respuesta UART del DFPlayer. La aceptación HTTP solo confirma que recibió la solicitud de red; no garantiza que haya empezado a reproducir.
+
+### Volumen y calidad de audio
+
+- `DAC_L` y `DAC_R` son salidas de nivel de línea, no amplifican auriculares. Para auriculares usa un amplificador de auriculares; para parlantes activos conecta la entrada AUX a `DAC_L`, `DAC_R` y GND.
+- Para un parlante pasivo usa `SPK1` y `SPK2` (no conectes ninguno a GND). La potencia y los graves dependen del parlante, de la caja acústica y de una alimentación estable de 5 V con corriente suficiente.
+- El firmware aplica por defecto el ecualizador **Bass** del DFPlayer (`PLAYER_EQ = 5`; valores 0–5). Puedes añadir `PLAYER_EQ = 0` a `config.py` para volver a Normal, u otros valores: Pop 1, Rock 2, Jazz 3, Classic 4.
+- El volumen inicial está en `PLAYER_VOLUME = 22` (rango 0–30) en `config.py`. Puedes probar 24–26 y ajustar gradualmente; subirlo no añade graves y al máximo puede distorsionar. Apaga el circuito antes de cambiar conexiones.
+- Si conectas auriculares directamente a `DAC_L`/`DAC_R`, la señal de nivel de línea puede no tener potencia suficiente. La ecualización puede cambiar el balance tonal, pero no sustituye un amplificador de auriculares; compara con parlantes activos por AUX o un amplificador.
 
 ## Ejecutar
 
@@ -166,8 +177,10 @@ En Telegram prueba:
 - `dame canciones movidas`
 - `buenos hits de los 80`
 - `canciones de Queen`
+- `¿Qué te parece Purple Rain?` (si está indexada con una ruta SD, ofrecerá reproducirla)
 - `me gustaría que me reproduzcas esa canción` (resuelve referencias recientes y ofrece el botón si el tema está indexado)
 - `/buscar rock argentino de los 90`
+- `/pausar` y `/reanudar`
 
 El bot también ofrece `/start` y `/help`. Si no hay resultados, comprueba los metadatos de la colección, el nombre de la base y el de la colección.
 

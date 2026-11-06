@@ -8,12 +8,15 @@ from unittest.mock import Mock, patch
 from app.ai_service import AIService, _is_quota_error
 from app.bot import (
     _CHAT_WEB_LOOKUP_REQUEST,
+    _LIBRARY_AVAILABILITY_QUESTION,
     _MUSIC_WANT_REQUEST,
     _PLAYBACK_REQUEST,
+    _REPEAT_PLAYBACK_REQUEST,
     _RECOMMENDATION_REQUEST,
     _needs_chat_web_lookup,
 )
 from app.config import Settings
+from app.database import SongDatabase
 from app.device_client import DeviceClient
 from app.recommender import Recommender, build_mongo_query
 from app.sd_path import parse_sd_path
@@ -65,14 +68,55 @@ class MessageRoutingTests(unittest.TestCase):
         self.assertIn("Bohemian Rhapsody", prompt)
         self.assertEqual(result["title"], "Bohemian Rhapsody")
 
+    def test_chat_extracts_only_an_explicit_song_reference(self):
+        ai = AIService.__new__(AIService)
+        ai.settings = SimpleNamespace(ai_model="test")
+        ai.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    message=SimpleNamespace(
+                                        content=(
+                                            '{"reply":"Es un tema muy conocido.",'
+                                            '"mentioned_song_title":"Purple Rain",'
+                                            '"mentioned_song_artist":"Prince"}'
+                                        )
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                )
+            )
+        )
+
+        reply, song = ai.chat_music("¿Qué tiene de especial Purple Rain?", [])
+        self.assertEqual(reply, "Es un tema muy conocido.")
+        self.assertEqual(song, {"title": "Purple Rain", "artist": "Prince"})
+
     def test_music_question_is_routed_to_conversation(self):
         message = "¿Qué hace especial a Prince?"
         self.assertIsNone(_MUSIC_WANT_REQUEST.search(message))
         self.assertIsNone(_RECOMMENDATION_REQUEST.search(message))
 
+    def test_internet_access_question_is_routed_to_conversation(self):
+        message = "tienes acceso a internet?"
+        self.assertIsNone(_RECOMMENDATION_REQUEST.search(message))
+
+    def test_song_availability_question_still_routes_to_library(self):
+        message = "tienes canciones de Queen?"
+        self.assertTrue(_RECOMMENDATION_REQUEST.search(message))
+
     def test_playback_request_is_not_routed_as_a_recommendation(self):
         message = "puedes ponerme esa canción en el reproductor?"
         self.assertTrue(_PLAYBACK_REQUEST.search(message))
+
+    def test_library_availability_question_stays_in_conversation(self):
+        message = "no la tienes para escucharla?"
+        self.assertTrue(_LIBRARY_AVAILABILITY_QUESTION.search(message))
 
     def test_song_recommendation_is_not_mistaken_for_playback(self):
         message = "poneme hits movidos de los 80"
@@ -90,6 +134,9 @@ class MessageRoutingTests(unittest.TestCase):
 
     def test_follow_up_playback_request_is_detected(self):
         self.assertTrue(_PLAYBACK_REQUEST.search("me gustaría que me la reproduzcas"))
+
+    def test_repeat_request_is_not_sent_as_an_unqualified_search(self):
+        self.assertTrue(_REPEAT_PLAYBACK_REQUEST.search("quiero escucharla otra vez"))
 
 
 class BuildMongoQueryTests(unittest.TestCase):
@@ -252,6 +299,109 @@ class SDPathTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(parse_sd_path(path))
 
+    def test_chat_song_lookup_requires_exact_names_and_a_valid_sd_path(self):
+        database = SongDatabase.__new__(SongDatabase)
+        database.find_candidates = Mock(
+            return_value=[
+                {
+                    "_id": "invalid-path",
+                    "title": "Fine",
+                    "artist": "Lemon Demon",
+                    "sd_path": None,
+                },
+                {
+                    "_id": "playable",
+                    "title": "Fine",
+                    "artist": "Lemon Demon",
+                    "sd_path": "/01/002.mp3",
+                },
+            ]
+        )
+
+        result = database.find_playable_song_by_title_artist(
+            "Fine", "Lemon Demon"
+        )
+
+        self.assertEqual(result["_id"], "playable")
+        query = database.find_candidates.call_args.args[0]
+        self.assertEqual(query["title"]["$regex"], r"^Fine$")
+        self.assertEqual(query["artist"]["$regex"], r"^Lemon\ Demon$")
+
+    def test_chat_song_lookup_matches_title_and_artist_across_user_messages(self):
+        database = SongDatabase.__new__(SongDatabase)
+        database.find_candidates = Mock(
+            return_value=[
+                {
+                    "_id": "fine",
+                    "title": "Fine",
+                    "artist": "Lemon Demon",
+                    "sd_path": "/01/002.mp3",
+                }
+            ]
+        )
+
+        result = database.find_playable_song_mentioned_in(
+            ["Me gusta mucho Lemon Demon", "Sii, Fine"]
+        )
+
+        self.assertEqual(result["_id"], "fine")
+        database.find_candidates.assert_called_once_with(
+            {"sd_path": {"$exists": True, "$nin": [None, ""]}},
+            limit=500,
+        )
+
+    def test_chat_song_lookup_suggests_unique_title_without_artist_mention(self):
+        database = SongDatabase.__new__(SongDatabase)
+        database.find_candidates = Mock(
+            return_value=[
+                {
+                    "_id": "school-days",
+                    "title": "School Days",
+                    "artist": "ATLUS GAME MUSIC",
+                    "sd_path": "/01/003.mp3",
+                }
+            ]
+        )
+
+        result = database.find_playable_song_mentioned_in(
+            [
+                "Te gusta la música del videojuego persona?",
+                "Tenés alguna de persona 1?",
+                "Me gusta school days",
+            ]
+        )
+
+        self.assertEqual(result["_id"], "school-days")
+
+    def test_chat_song_lookup_requires_artist_to_disambiguate_duplicate_titles(self):
+        database = SongDatabase.__new__(SongDatabase)
+        database.find_candidates = Mock(
+            return_value=[
+                {
+                    "_id": "school-days-atlus",
+                    "title": "School Days",
+                    "artist": "ATLUS GAME MUSIC",
+                    "sd_path": "/01/003.mp3",
+                },
+                {
+                    "_id": "school-days-other",
+                    "title": "School Days",
+                    "artist": "Other Artist",
+                    "sd_path": "/02/001.mp3",
+                },
+            ]
+        )
+
+        without_artist = database.find_playable_song_mentioned_in(
+            ["Me gusta School Days"]
+        )
+        with_artist = database.find_playable_song_mentioned_in(
+            ["Me gusta School Days de ATLUS GAME MUSIC"]
+        )
+
+        self.assertIsNone(without_artist)
+        self.assertEqual(with_artist["_id"], "school-days-atlus")
+
     def test_device_client_sends_only_a_valid_sd_path_to_esp32(self):
         settings = Settings(
             telegram_bot_token="telegram",
@@ -303,6 +453,40 @@ class SDPathTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 DeviceClient(settings).play("../../secret.mp3")
         post.assert_not_called()
+
+    def test_device_client_sends_pause_and_resume_commands(self):
+        settings = Settings(
+            telegram_bot_token="telegram",
+            mongo_uri="mongodb://localhost:27017",
+            mongo_db="music",
+            mongo_collection="songs",
+            ai_model="test",
+            ai_api_key="test",
+            ai_base_url=None,
+            ai_timeout_seconds=3,
+            ai_top_results=5,
+            web_search_enabled=False,
+            web_search_api_key="",
+            web_search_max_results=5,
+            player_enabled=True,
+            esp32_base_url="http://192.168.1.50:8080",
+            esp32_api_token="a" * 24,
+        )
+        response = Mock()
+        response.json.return_value = {"accepted": True}
+        with patch("app.device_client.requests.post", return_value=response) as post:
+            device = DeviceClient(settings)
+            device.pause()
+            device.resume()
+
+        self.assertEqual(
+            [call.args[0] for call in post.call_args_list],
+            [
+                "http://192.168.1.50:8080/api/pause",
+                "http://192.168.1.50:8080/api/resume",
+            ],
+        )
+        self.assertEqual([call.kwargs["json"] for call in post.call_args_list], [{}, {}])
 
     def test_sd_indexer_adds_route_to_matching_mongodb_song(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -375,6 +559,15 @@ class DFPlayerProtocolTests(unittest.TestCase):
             checksum,
             (-(0xFF + 0x06 + 0x0F + 1 + 1 + 1)) & 0xFFFF,
         )
+
+    def test_pause_and_resume_commands_use_dfplayer_protocol_codes(self):
+        self.assertEqual(build_frame(0x0E)[3], 0x0E)
+        self.assertEqual(build_frame(0x0D)[3], 0x0D)
+
+    def test_dfplayer_bass_equalizer_command_uses_supported_mode(self):
+        frame = build_frame(0x07, 5)
+        self.assertEqual(frame[3], 0x07)
+        self.assertEqual(frame[6], 5)
 
 
 class SeedCatalogTests(unittest.TestCase):

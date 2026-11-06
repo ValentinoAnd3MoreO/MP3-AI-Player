@@ -6,7 +6,9 @@ from protocol import build_frame
 
 
 class DFPlayer:
-    def __init__(self, uart_id, tx_pin, rx_pin, baudrate=9600, volume=22):
+    def __init__(
+        self, uart_id, tx_pin, rx_pin, baudrate=9600, volume=22, equalizer=5
+    ):
         self.uart = UART(
             uart_id,
             baudrate=baudrate,
@@ -18,6 +20,7 @@ class DFPlayer:
         self._send(0x0C, 0)
         time.sleep_ms(1200)
         self._send(0x06, max(0, min(volume, 30)))
+        self._send(0x07, max(0, min(equalizer, 5)))
 
     def _send(self, command, parameter=0, feedback=0):
         self.uart.write(build_frame(command, parameter, feedback))
@@ -35,3 +38,9 @@ class DFPlayer:
             print("Respuesta UART del DFPlayer:", response)
         else:
             print("El DFPlayer no respondió por UART.")
+
+    def pause(self):
+        self._send(0x0E, feedback=1)
+
+    def resume(self):
+        self._send(0x0D, feedback=1)

@@ -92,7 +92,19 @@ def _handle(connection, player):
         if not _constant_time_equal(supplied, expected):
             _respond(connection, 401, {"accepted": False, "error": "unauthorized"})
             return
-        if method != "POST" or path != "/api/play":
+        if method != "POST":
+            _respond(connection, 400, {"accepted": False, "error": "invalid_route"})
+            return
+
+        if path == "/api/pause":
+            player.pause()
+            _respond(connection, 200, {"accepted": True, "action": "pause"})
+            return
+        if path == "/api/resume":
+            player.resume()
+            _respond(connection, 200, {"accepted": True, "action": "resume"})
+            return
+        if path != "/api/play":
             _respond(connection, 400, {"accepted": False, "error": "invalid_route"})
             return
 
@@ -161,3 +173,5 @@ def main():
 
 
 main()
+
+
