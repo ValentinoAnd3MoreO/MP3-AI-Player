@@ -151,6 +151,8 @@ El PC del bot y el ESP32 deben poder comunicarse en la misma red local. El endpo
 
 Luego reinicia el bot, indexa la tarjeta y pide una canción. El bot ofrece un botón **Reproducir** para los resultados que tienen `sd_path`; la reproducción ocurre solo cuando lo pulsas. Las canciones de catálogo de prueba no tienen MP3 ni ruta SD hasta que indexas audio real.
 
+Al pulsar reproducir, la consola serie del ESP32 muestra la respuesta UART del DFPlayer o indica que no hubo respuesta. La aceptación HTTP del ESP32 solo confirma que recibió la solicitud de red; no garantiza que el módulo haya empezado a reproducir.
+
 ## Ejecutar
 
 Con MongoDB encendido, desde esta carpeta ejecuta:

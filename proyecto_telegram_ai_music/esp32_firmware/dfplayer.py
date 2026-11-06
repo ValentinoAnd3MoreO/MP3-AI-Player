@@ -19,11 +19,19 @@ class DFPlayer:
         time.sleep_ms(1200)
         self._send(0x06, max(0, min(volume, 30)))
 
-    def _send(self, command, parameter=0):
-        self.uart.write(build_frame(command, parameter))
+    def _send(self, command, parameter=0, feedback=0):
+        self.uart.write(build_frame(command, parameter, feedback))
         time.sleep_ms(100)
 
     def play_folder_track(self, folder, track):
         if not 1 <= folder <= 99 or not 1 <= track <= 255:
             raise ValueError("Carpeta o número de canción fuera de rango.")
-        self._send(0x0F, (folder << 8) | track)
+        while self.uart.any():
+            self.uart.read()
+        self._send(0x0F, (folder << 8) | track, feedback=1)
+        time.sleep_ms(300)
+        response = self.uart.read()
+        if response:
+            print("Respuesta UART del DFPlayer:", response)
+        else:
+            print("El DFPlayer no respondió por UART.")

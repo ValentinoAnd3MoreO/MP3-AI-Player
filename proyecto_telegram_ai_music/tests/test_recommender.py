@@ -333,6 +333,30 @@ class SDPathTests(unittest.TestCase):
         self.assertEqual(update["year"], 1984)
         self.assertEqual(collection.update_one.call_args.args[0], {"_id": "existing-song"})
 
+    def test_sd_indexer_adds_route_to_duplicate_matching_songs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mp3 = root / "01" / "001.mp3"
+            mp3.parent.mkdir()
+            mp3.write_bytes(b"test")
+            collection = Mock()
+            collection.find_one.return_value = None
+            collection.update_many.return_value.matched_count = 2
+            tags = {"title": ["Purple Rain"], "artist": ["Prince"]}
+            with patch(
+                "scripts.index_sd_card.MutagenFile",
+                return_value=SimpleNamespace(tags=tags),
+            ):
+                indexed, skipped = index_sd_card(root, collection)
+
+        self.assertEqual((indexed, skipped), (1, 0))
+        query = collection.update_many.call_args.args[0]
+        self.assertEqual(query["title"]["$regex"], r"^Purple\ Rain$")
+        self.assertEqual(query["artist"]["$regex"], r"^Prince$")
+        update = collection.update_many.call_args.args[1]["$set"]
+        self.assertEqual(update["sd_path"], "/01/001.mp3")
+        collection.update_one.assert_not_called()
+
 
 class DFPlayerProtocolTests(unittest.TestCase):
     def test_builds_play_folder_command_frame(self):
@@ -342,6 +366,15 @@ class DFPlayerProtocolTests(unittest.TestCase):
         self.assertEqual(frame[-1], 0xEF)
         checksum = (frame[7] << 8) | frame[8]
         self.assertEqual(checksum, (-(0xFF + 0x06 + 0x0F + 1 + 3)) & 0xFFFF)
+
+    def test_requests_feedback_for_dfplayer_command(self):
+        frame = build_frame(0x0F, (1 << 8) | 1, feedback=1)
+        self.assertEqual(frame[4], 1)
+        checksum = (frame[7] << 8) | frame[8]
+        self.assertEqual(
+            checksum,
+            (-(0xFF + 0x06 + 0x0F + 1 + 1 + 1)) & 0xFFFF,
+        )
 
 
 class SeedCatalogTests(unittest.TestCase):

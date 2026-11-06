@@ -89,23 +89,29 @@ def index_sd_card(sd_root: Path, collection) -> tuple[int, int]:
             skipped += 1
             continue
 
-        existing = collection.find_one({"sd_path": document["sd_path"]}, {"_id": 1})
-        if not existing:
-            title_pattern = f"^{re.escape(document['title'])}$"
-            artist_pattern = f"^{re.escape(document['artist'])}$"
-            existing = collection.find_one(
-                {
-                    "title": {"$regex": title_pattern, "$options": "i"},
-                    "artist": {"$regex": artist_pattern, "$options": "i"},
-                },
-                {"_id": 1},
-            )
+        identity_query = {
+            "title": {
+                "$regex": f"^{re.escape(document['title'])}$",
+                "$options": "i",
+            },
+            "artist": {
+                "$regex": f"^{re.escape(document['artist'])}$",
+                "$options": "i",
+            },
+        }
+        existing = collection.find_one(
+            {"sd_path": document["sd_path"]}, {"_id": 1}
+        )
         if existing:
             collection.update_one(
                 {"_id": existing["_id"]},
                 {"$set": document},
             )
-        else:
+        matching_songs = collection.update_many(
+            identity_query,
+            {"$set": document},
+        )
+        if not existing and not matching_songs.matched_count:
             folder, track = parse_sd_path(document["sd_path"])
             document_id = f"dfplayer-{folder:02d}-{track:03d}"
             collection.update_one(
