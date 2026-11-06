@@ -128,6 +128,8 @@ microSD/
     └── 001.mp3
 ```
 
+Usa la carpeta `02` para las canciones de la saga de videojuegos Persona; numéralas en orden (`001.mp3`, `002.mp3`, etc.). Por ejemplo, **School Days** está en `/02/001.mp3`. El indexador guarda la carpeta y el número que realmente encuentre en la tarjeta.
+
 Los archivos deben tener etiquetas ID3 con al menos título y artista. Conecta la tarjeta al PC y ejecuta el indexador apuntando a su letra (ajusta `E:\`):
 
 ```powershell
