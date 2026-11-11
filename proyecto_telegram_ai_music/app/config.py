@@ -30,6 +30,7 @@ class Settings:
     player_enabled: bool
     esp32_base_url: str
     esp32_api_token: str
+    ai_transcription_model: str = "whisper-1"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -51,6 +52,9 @@ class Settings:
             player_enabled=_env_bool("PLAYER_ENABLED"),
             esp32_base_url=os.getenv("ESP32_BASE_URL", "").rstrip("/"),
             esp32_api_token=os.getenv("ESP32_API_TOKEN", ""),
+            ai_transcription_model=(
+                os.getenv("AI_TRANSCRIPTION_MODEL", "").strip() or "whisper-1"
+            ),
         )
 
     def validate(self) -> None:

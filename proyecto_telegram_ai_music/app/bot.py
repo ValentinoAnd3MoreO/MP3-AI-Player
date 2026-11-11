@@ -3,8 +3,10 @@ import html
 import logging
 import re
 import uuid
+from datetime import timedelta
 
 import requests
+from telegram.error import TelegramError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -26,13 +28,28 @@ from app.ai_service import (
 from app.config import Settings
 from app.database import SongDatabase
 from app.device_client import DeviceClient, PlayerNotConfiguredError
+from app.playback_history import PlaybackHistory, REPORT_TIMEZONE
 from app.recommender import Recommender
 from app.sd_path import parse_sd_path
 
 logger = logging.getLogger(__name__)
+_MAX_VOICE_FILE_SIZE = 20 * 1024 * 1024
 _RECOMMENDATION_REQUEST = re.compile(
     r"\b(canciones?|temas?|hits?|recomiend\w*|suger\w*|"
     r"dame|pon(?:me|eme)?|busco|buscar|escuch\w*|reproduc\w*)\b",
+    re.IGNORECASE,
+)
+_REPORT_REQUEST = re.compile(
+    r"\b(?:report(?:e|es)|inform(?:e|es)|estad[ií]stic\w*|res[uú]men)\b"
+    r"|\b(?:qu[eé]|cu[aá]nt[oa]s?|mostr[aá]me|mu[eé]strame|dime)\b"
+    r".{0,80}\b(?:escuch\w*|reproduc\w*|sonad\w*)\b"
+    r"|\btop\b.{0,50}\b(?:escuch\w*|reproduc\w*)\b",
+    re.IGNORECASE,
+)
+_REPORT_CONTEXT_REQUEST = re.compile(
+    r"\bmis?\b.{0,60}\b(?:semana|d[ií]a|escuch\w*|reproduc\w*|"
+    r"historial|actividad musical)\b"
+    r"|\bm[aá]s escuchad\w*\b",
     re.IGNORECASE,
 )
 _MUSIC_WANT_REQUEST = re.compile(
@@ -88,6 +105,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "biblioteca. Por ejemplo: «¿Qué hace especial a Prince?» o "
         "«poneme hits movidos de los 80». Si la canción está mapeada en la "
         "microSD y el ESP32 está conectado, también verás un botón para reproducirla. "
+        "También puedes enviarme un mensaje de voz con tu pedido. "
         "Usa /reset para borrar el contexto."
     )
 
@@ -98,8 +116,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "de una petición, por ejemplo /buscar rock de los 90. También puedes "
         "preguntarme sobre artistas, canciones, géneros e historia de la música. "
         "Las recomendaciones con una ruta SD válida tendrán un botón de reproducción. "
-        "Usa /pausar y /reanudar para controlar el audio, y /reset para iniciar "
-        "una conversación nueva."
+        "También puedes enviar un mensaje de voz de hasta 20 MB; lo transcribiré "
+        "con el proveedor de IA configurado. "
+        "Usa /pausar y /reanudar para controlar el audio, /reportes diario o "
+        "/reportes semanal para ver tus estadísticas, y /reset para iniciar "
+        "una conversación nueva. También puedes pedirme el informe con tus palabras."
     )
 
 
@@ -294,11 +315,27 @@ async def play_song_callback(
         )
         return
 
+    history = context.application.bot_data["playback_history"]
+    try:
+        await asyncio.to_thread(
+            history.start, song, update.effective_user.id
+        )
+    except PyMongoError:
+        logger.exception("No se pudo guardar el inicio de reproducción en MongoDB")
+        history_warning = (
+            "La orden de reproducción se envió, pero no pude guardar el historial "
+            "en MongoDB."
+        )
+    else:
+        history_warning = None
+
     await query.message.reply_text(
         f"Orden enviada al ESP32: {song.get('title', 'la canción')}.",
         reply_markup=_player_control_keyboard(),
     )
     context.user_data["last_played_song_id"] = str(song["_id"])
+    if history_warning:
+        await query.message.reply_text(history_warning)
 
 
 async def repeat_last_song(
@@ -387,13 +424,24 @@ async def _send_player_control(
                 "resume" if action == "pause" else "pause"
             )
         )
-    else:
-        label = (
-            "Pausa enviada al ESP32."
-            if action == "pause"
-            else "Reanudación enviada al ESP32."
+    history = context.application.bot_data["playback_history"]
+    try:
+        changed = await asyncio.to_thread(getattr(history, action))
+    except PyMongoError:
+        logger.exception("No se pudo actualizar la sesión de reproducción")
+        await update.effective_message.reply_text(
+            "El control se envió al reproductor, pero no pude actualizar el "
+            "historial en MongoDB."
         )
-        await update.effective_message.reply_text(label)
+        return
+    if not changed:
+        logger.info("No había una sesión activa que actualizar para %s.", action)
+    label = (
+        "Pausa enviada al ESP32."
+        if action == "pause"
+        else "Reanudación enviada al ESP32."
+    )
+    await update.effective_message.reply_text(label)
 
 
 async def player_control_callback(
@@ -401,6 +449,132 @@ async def player_control_callback(
 ) -> None:
     action = update.callback_query.data.partition(":")[2]
     await _send_player_control(update, context, action)
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min {seconds:02d} s"
+    return f"{seconds} s"
+
+
+def _format_playback_report(report: dict) -> str:
+    period = report["period"]
+    start_local = report["start"].astimezone(REPORT_TIMEZONE)
+    if period == "daily":
+        heading = f"Informe diario — {start_local:%d/%m/%Y}"
+    else:
+        end_local = report["end"].astimezone(REPORT_TIMEZONE)
+        heading = (
+            f"Informe semanal — {start_local:%d/%m} al "
+            f"{(end_local - timedelta(days=1)):%d/%m/%Y}"
+        )
+    lines = [f"<b>{heading}</b>"]
+    if report["play_count"] == 0:
+        lines.append("Todavía no hay reproducciones registradas en este período.")
+        return "\n".join(lines)
+
+    lines.append(
+        f"Tiempo escuchado: <b>{_format_duration(report['total_seconds'])}</b>"
+    )
+    lines.append(f"Reproducciones registradas: {report['play_count']}")
+    if report["top_songs"]:
+        lines.append("\n<b>Top 5 canciones:</b>")
+        for index, song in enumerate(report["top_songs"], 1):
+            title = html.escape(str(song["title"]))
+            artist = html.escape(str(song["artist"]))
+            lines.append(
+                f"{index}. {title} — {artist} · {song['plays']} "
+                f"reprod. · {_format_duration(song['seconds'])}"
+            )
+    if report["top_genres"]:
+        lines.append("\n<b>Géneros más escuchados:</b>")
+        for index, (genre, seconds) in enumerate(report["top_genres"], 1):
+            lines.append(
+                f"{index}. {html.escape(genre)} · {_format_duration(seconds)}"
+            )
+        if len(report["top_genres"]) < 3:
+            lines.append(
+                "Nota: varias canciones todavía no tienen género en sus etiquetas."
+            )
+    else:
+        lines.append(
+            "\nTodavía no hay géneros etiquetados en las canciones reproducidas."
+        )
+    return "\n".join(lines)
+
+
+async def send_playback_report(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, period: str
+) -> None:
+    history = context.application.bot_data["playback_history"]
+    try:
+        report = await asyncio.to_thread(history.report, period)
+    except PyMongoError:
+        logger.exception("No se pudo consultar el historial de reproducción")
+        await update.effective_message.reply_text(
+            "No pude consultar el historial de reproducciones en MongoDB."
+        )
+        return
+    await update.effective_message.reply_text(
+        _format_playback_report(report), parse_mode=ParseMode.HTML
+    )
+
+
+async def reports_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    period_text = context.args[0].casefold() if context.args else "diario"
+    if period_text in {"diario", "diaria", "hoy", "daily"}:
+        period = "daily"
+    elif period_text in {"semanal", "semana", "weekly"}:
+        period = "weekly"
+    else:
+        await update.effective_message.reply_text(
+            "Uso: /reportes diario o /reportes semanal"
+        )
+        return
+    await send_playback_report(update, context, period)
+
+
+async def _try_natural_language_report(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message: str
+) -> bool:
+    if not (
+        _REPORT_REQUEST.search(message) or _REPORT_CONTEXT_REQUEST.search(message)
+    ):
+        return False
+    ai: AIService = context.application.bot_data["ai"]
+    try:
+        period = await asyncio.to_thread(ai.classify_report_period, message)
+    except AIQuotaExceededError:
+        await update.effective_message.reply_text(
+            "No pude interpretar el pedido porque se agotó la cuota del proveedor "
+            "de IA. También puedes usar /reportes diario o /reportes semanal."
+        )
+        return True
+    except AIRateLimitError:
+        await update.effective_message.reply_text(
+            "La IA está limitando solicitudes temporalmente. Prueba /reportes "
+            "diario o /reportes semanal."
+        )
+        return True
+    except Exception:
+        logger.exception("No se pudo interpretar el pedido de informe")
+        await update.effective_message.reply_text(
+            "No pude interpretar el pedido ahora. Prueba /reportes diario o "
+            "/reportes semanal."
+        )
+        return True
+
+    if period:
+        await send_playback_report(update, context, period)
+        return True
+    return False
 
 
 def _remember_exchange(
@@ -506,7 +680,14 @@ async def chat_message(
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message.text
+    await process_text_message(update, context, update.message.text)
+
+
+async def process_text_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, message: str
+) -> None:
+    if await _try_natural_language_report(update, context, message):
+        return
     if _REPEAT_PLAYBACK_REQUEST.search(message):
         await repeat_last_song(update, context)
     elif _LIBRARY_AVAILABILITY_QUESTION.search(message):
@@ -520,6 +701,60 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await recommend_text(message, update, context)
     else:
         await chat_message(update, context, message)
+
+
+async def voice_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    voice = message.voice if message else None
+    if not message or not voice:
+        return
+    if voice.file_size and voice.file_size > _MAX_VOICE_FILE_SIZE:
+        await message.reply_text(
+            "Ese audio supera el límite de 20 MB que puedo procesar. "
+            "Envía un mensaje de voz más corto."
+        )
+        return
+
+    await message.chat.send_action("typing")
+    try:
+        audio_file = await context.bot.get_file(voice.file_id)
+        audio = bytes(await audio_file.download_as_bytearray())
+    except TelegramError:
+        logger.exception("No se pudo descargar el mensaje de voz de Telegram")
+        await message.reply_text(
+            "No pude descargar el audio de Telegram. Inténtalo otra vez."
+        )
+        return
+
+    ai: AIService = context.application.bot_data["ai"]
+    try:
+        transcript = await asyncio.to_thread(
+            ai.transcribe_audio, audio, "voice.ogg"
+        )
+    except AIQuotaExceededError:
+        await message.reply_text(
+            "Se agotó la cuota del proveedor de IA y no pude transcribir el audio. "
+            "Revisa la facturación de tu proveedor e inténtalo luego."
+        )
+        return
+    except AIRateLimitError:
+        await message.reply_text(
+            "El proveedor de IA está limitando solicitudes temporalmente. "
+            "Inténtalo de nuevo en un momento."
+        )
+        return
+    except Exception:
+        logger.exception("No se pudo transcribir el mensaje de voz")
+        await message.reply_text(
+            "No pude transcribir el audio. Comprueba que tu proveedor de IA "
+            "admita transcripciones de voz y vuelve a intentarlo."
+        )
+        return
+
+    await message.reply_text(f"Entendí: «{transcript}»")
+    await process_text_message(update, context, transcript)
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -542,12 +777,16 @@ def create_application(settings: Settings) -> Application:
     application.bot_data["device"] = DeviceClient(settings)
     application.bot_data["player_settings"] = settings
     application.bot_data["database"] = database
+    application.bot_data["playback_history"] = PlaybackHistory(
+        database.client[settings.mongo_db]["playback_sessions"]
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("reset", reset_chat))
     application.add_handler(CommandHandler("buscar", search_command))
     application.add_handler(CommandHandler("pausar", pause_command))
     application.add_handler(CommandHandler("reanudar", resume_command))
+    application.add_handler(CommandHandler("reportes", reports_command))
     application.add_handler(
         CallbackQueryHandler(play_song_callback, pattern=r"^play:[0-9a-f]{16}$")
     )
@@ -559,5 +798,6 @@ def create_application(settings: Settings) -> Application:
     application.add_handler(
         CallbackQueryHandler(player_control_callback, pattern=r"^control:(pause|resume)$")
     )
+    application.add_handler(MessageHandler(filters.VOICE, voice_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     return application

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import math
 import re
 from pathlib import Path
 
@@ -65,9 +66,14 @@ def _song_document(path: Path, sd_root: Path) -> dict | None:
         document["album"] = album
     if genres:
         document["genre"] = genres
-    if year_match:
+    duration = getattr(getattr(metadata, "info", None), "length", None)
+    if isinstance(duration, (int, float)) and duration > 0:
+        document["duration_sec"] = math.ceil(duration)
+    if year_match and int(year_match.group()) != 1970:
         document["year"] = int(year_match.group())
         document["decade"] = (document["year"] // 10) * 10
+    elif year_match:
+        document["_unset_fields"] = ["year", "decade"]
     return document
 
 
@@ -81,13 +87,19 @@ def index_sd_card(sd_root: Path, collection) -> tuple[int, int]:
     mp3_files = (
         path
         for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() == ".mp3"
+        if path.is_file()
+        and path.suffix.lower() == ".mp3"
+        and parse_sd_path(f"/{path.relative_to(root).as_posix()}") is not None
     )
     for path in sorted(mp3_files):
         document = _song_document(path, root)
         if not document:
             skipped += 1
             continue
+        unset_fields = document.pop("_unset_fields", [])
+        update = {"$set": document}
+        if unset_fields:
+            update["$unset"] = {field: "" for field in unset_fields}
 
         identity_query = {
             "title": {
@@ -105,20 +117,28 @@ def index_sd_card(sd_root: Path, collection) -> tuple[int, int]:
         if existing:
             collection.update_one(
                 {"_id": existing["_id"]},
-                {"$set": document},
+                update,
             )
         matching_songs = collection.update_many(
             identity_query,
-            {"$set": document},
+            update,
         )
         if not existing and not matching_songs.matched_count:
             folder, track = parse_sd_path(document["sd_path"])
             document_id = f"dfplayer-{folder:02d}-{track:03d}"
-            collection.update_one(
-                {"_id": document_id},
-                {"$set": document},
-                upsert=True,
-            )
+            id_conflict = collection.find_one({"_id": document_id}, {"_id": 1})
+            if id_conflict:
+                collection.update_one(
+                    {"sd_path": document["sd_path"]},
+                    update,
+                    upsert=True,
+                )
+            else:
+                collection.update_one(
+                    {"_id": document_id},
+                    update,
+                    upsert=True,
+                )
         indexed += 1
 
     return indexed, skipped

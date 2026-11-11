@@ -1,9 +1,12 @@
 import re
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from pymongo.errors import PyMongoError
 
 from app.ai_service import AIService, _is_quota_error
 from app.bot import (
@@ -13,14 +16,27 @@ from app.bot import (
     _PLAYBACK_REQUEST,
     _REPEAT_PLAYBACK_REQUEST,
     _RECOMMENDATION_REQUEST,
+    _REPORT_CONTEXT_REQUEST,
+    _REPORT_REQUEST,
+    _format_playback_report,
+    send_playback_report,
+    _try_natural_language_report,
     _needs_chat_web_lookup,
+    reports_command,
+    voice_message,
 )
 from app.config import Settings
 from app.database import SongDatabase
 from app.device_client import DeviceClient
+from app.playback_history import (
+    PlaybackHistory,
+    build_playback_report,
+    report_period_bounds,
+)
 from app.recommender import Recommender, build_mongo_query
 from app.sd_path import parse_sd_path
 from scripts.index_sd_card import index_sd_card
+from scripts.organize_sd_library import _infer_deftones_title
 from esp32_firmware.protocol import build_frame
 from scripts.seed_alternative_rock import (
     ALTERNATIVE_ROCK,
@@ -40,6 +56,40 @@ class AIQuotaDetectionTests(unittest.TestCase):
 
     def test_does_not_mistake_temporary_rate_limit_for_empty_credits(self):
         self.assertFalse(_is_quota_error(Exception("Too many requests")))
+
+    def test_transcribes_voice_in_spanish_with_configured_model(self):
+        ai = AIService.__new__(AIService)
+        ai.settings = SimpleNamespace(ai_transcription_model="whisper-test")
+        create = Mock(return_value=SimpleNamespace(text="  hits de los 80  "))
+        ai.client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=create)
+            )
+        )
+
+        transcript = ai.transcribe_audio(b"ogg-data")
+
+        self.assertEqual(transcript, "hits de los 80")
+        create.assert_called_once_with(
+            model="whisper-test",
+            file=("voice.ogg", b"ogg-data", "audio/ogg"),
+            language="es",
+        )
+
+    def test_rejects_empty_audio_and_empty_transcriptions(self):
+        ai = AIService.__new__(AIService)
+        ai.settings = SimpleNamespace(ai_transcription_model="whisper-test")
+        create = Mock(return_value=SimpleNamespace(text="  "))
+        ai.client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=create)
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            ai.transcribe_audio(b"")
+        with self.assertRaises(ValueError):
+            ai.transcribe_audio(b"ogg-data")
 
 
 class MessageRoutingTests(unittest.TestCase):
@@ -132,6 +182,12 @@ class MessageRoutingTests(unittest.TestCase):
     def test_static_music_question_does_not_trigger_web_search(self):
         self.assertFalse(_needs_chat_web_lookup("¿Qué hace especial a Prince?"))
 
+    def test_natural_language_playback_report_request_is_detected(self):
+        self.assertTrue(_REPORT_REQUEST.search("¿Qué escuché esta semana?"))
+        self.assertTrue(_REPORT_REQUEST.search("¿Cuánto tiempo escuché hoy?"))
+        self.assertTrue(_REPORT_CONTEXT_REQUEST.search("mis canciones más escuchadas"))
+        self.assertFalse(_REPORT_REQUEST.search("¿Qué canciones movidas recomiendas?"))
+
     def test_follow_up_playback_request_is_detected(self):
         self.assertTrue(_PLAYBACK_REQUEST.search("me gustaría que me la reproduzcas"))
 
@@ -193,6 +249,50 @@ class BuildMongoQueryTests(unittest.TestCase):
             ),
             {},
         )
+
+
+class VoiceMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transcribes_voice_and_routes_transcript_through_text_flow(self):
+        message = Mock()
+        message.voice.file_id = "telegram-file"
+        message.voice.file_size = 100
+        message.chat.send_action = AsyncMock()
+        message.reply_text = AsyncMock()
+        update = Mock(effective_message=message)
+        audio_file = Mock()
+        audio_file.download_as_bytearray = AsyncMock(
+            return_value=bytearray(b"ogg-data")
+        )
+        context = Mock()
+        context.bot.get_file = AsyncMock(return_value=audio_file)
+        ai = Mock()
+        ai.transcribe_audio.return_value = "buenos hits de los 80"
+        context.application.bot_data = {"ai": ai}
+
+        with patch("app.bot.process_text_message", new_callable=AsyncMock) as route:
+            await voice_message(update, context)
+
+        ai.transcribe_audio.assert_called_once_with(b"ogg-data", "voice.ogg")
+        message.reply_text.assert_awaited_once_with(
+            "Entendí: «buenos hits de los 80»"
+        )
+        route.assert_awaited_once_with(
+            update, context, "buenos hits de los 80"
+        )
+
+    async def test_rejects_voice_larger_than_telegram_download_limit(self):
+        message = Mock()
+        message.voice.file_id = "telegram-file"
+        message.voice.file_size = 21 * 1024 * 1024
+        message.reply_text = AsyncMock()
+        update = Mock(effective_message=message)
+        context = Mock()
+        context.bot.get_file = AsyncMock()
+
+        await voice_message(update, context)
+
+        message.reply_text.assert_awaited_once()
+        context.bot.get_file.assert_not_awaited()
 
 
 class RecommenderTests(unittest.TestCase):
@@ -505,7 +605,9 @@ class SDPathTests(unittest.TestCase):
             }
             with patch(
                 "scripts.index_sd_card.MutagenFile",
-                return_value=SimpleNamespace(tags=tags),
+                return_value=SimpleNamespace(
+                    tags=tags, info=SimpleNamespace(length=227.2)
+                ),
             ):
                 indexed, skipped = index_sd_card(root, collection)
 
@@ -515,6 +617,7 @@ class SDPathTests(unittest.TestCase):
         self.assertEqual(update["dfplayer_folder"], 1)
         self.assertEqual(update["dfplayer_track"], 3)
         self.assertEqual(update["year"], 1984)
+        self.assertEqual(update["duration_sec"], 228)
         self.assertEqual(collection.update_one.call_args.args[0], {"_id": "existing-song"})
 
     def test_sd_indexer_adds_route_to_duplicate_matching_songs(self):
@@ -540,6 +643,519 @@ class SDPathTests(unittest.TestCase):
         update = collection.update_many.call_args.args[1]["$set"]
         self.assertEqual(update["sd_path"], "/01/001.mp3")
         collection.update_one.assert_not_called()
+
+    def test_sd_indexer_unsets_unreliable_1970_year(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mp3 = root / "01" / "001.mp3"
+            mp3.parent.mkdir()
+            mp3.write_bytes(b"test")
+            collection = Mock()
+            collection.find_one.return_value = {"_id": "existing-song"}
+            tags = {
+                "title": ["Old Song"],
+                "artist": ["Example Artist"],
+                "date": ["1970"],
+            }
+            with patch(
+                "scripts.index_sd_card.MutagenFile",
+                return_value=SimpleNamespace(tags=tags),
+            ):
+                index_sd_card(root, collection)
+
+        update = collection.update_one.call_args.args[1]
+        self.assertNotIn("year", update["$set"])
+        self.assertEqual(update["$unset"], {"year": "", "decade": ""})
+
+    def test_sd_indexer_ignores_non_dfplayer_filenames(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            invalid_mp3 = root / "01" / "song.mp3"
+            invalid_mp3.parent.mkdir()
+            invalid_mp3.write_bytes(b"test")
+            collection = Mock()
+            with patch("scripts.index_sd_card.MutagenFile") as read_metadata:
+                indexed, skipped = index_sd_card(root, collection)
+
+        self.assertEqual((indexed, skipped), (0, 0))
+        read_metadata.assert_not_called()
+
+    def test_sd_indexer_avoids_deterministic_id_collision(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            mp3 = root / "01" / "001.mp3"
+            mp3.parent.mkdir()
+            mp3.write_bytes(b"test")
+            collection = Mock()
+            collection.find_one.side_effect = [None, {"_id": "another-song"}]
+            collection.update_many.return_value.matched_count = 0
+            tags = {"title": ["Purple Rain"], "artist": ["Prince"]}
+            with patch(
+                "scripts.index_sd_card.MutagenFile",
+                return_value=SimpleNamespace(tags=tags),
+            ):
+                indexed, skipped = index_sd_card(root, collection)
+
+        self.assertEqual((indexed, skipped), (1, 0))
+        query, update = collection.update_one.call_args.args
+        self.assertEqual(query, {"sd_path": "/01/001.mp3"})
+        self.assertTrue(collection.update_one.call_args.kwargs["upsert"])
+        self.assertEqual(update["$set"]["title"], "Purple Rain")
+
+
+class LibraryOrganizationTests(unittest.TestCase):
+    def test_infers_deftones_title_from_filename(self):
+        self.assertEqual(
+            _infer_deftones_title("Deftones - Be Quiet and Drive - My Music Harbourage.mp3"),
+            "Be Quiet and Drive",
+        )
+
+
+class PlaybackHistoryTests(unittest.TestCase):
+    def test_daily_and_weekly_bounds_use_argentina_local_calendar(self):
+        now = datetime(2026, 11, 11, 2, tzinfo=timezone.utc)
+
+        daily_start, daily_end = report_period_bounds("daily", now)
+        weekly_start, weekly_end = report_period_bounds("weekly", now)
+
+        self.assertEqual(daily_start, datetime(2026, 11, 10, 3, tzinfo=timezone.utc))
+        self.assertEqual(daily_end, datetime(2026, 11, 11, 3, tzinfo=timezone.utc))
+        self.assertEqual(weekly_start, datetime(2026, 11, 9, 3, tzinfo=timezone.utc))
+        self.assertEqual(weekly_end, datetime(2026, 11, 16, 3, tzinfo=timezone.utc))
+
+    def test_rejects_unknown_report_period(self):
+        with self.assertRaises(ValueError):
+            report_period_bounds("monthly")
+
+    def test_report_sums_play_time_minus_pauses_and_ranks_songs(self):
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        start, _ = report_period_bounds("daily", now)
+        first_start = start + timedelta(hours=10)
+        sessions = [
+            {
+                "song_id": "song-a",
+                "sd_path": "/01/001.mp3",
+                "title": "First Song",
+                "artist": "Artist",
+                "genre": ["Rock"],
+                "duration_sec": 3600,
+                "started_at": first_start,
+                "ended_at": first_start + timedelta(minutes=60),
+                "pause_intervals": [
+                    {
+                        "started_at": first_start + timedelta(minutes=20),
+                        "ended_at": first_start + timedelta(minutes=30),
+                    }
+                ],
+            },
+            {
+                "song_id": "song-a",
+                "sd_path": "/01/001.mp3",
+                "title": "First Song",
+                "artist": "Artist",
+                "genre": ["Rock"],
+                "duration_sec": 3600,
+                "started_at": first_start + timedelta(hours=2),
+                "ended_at": first_start + timedelta(hours=2, minutes=30),
+                "pause_intervals": [],
+            },
+            {
+                "song_id": "song-b",
+                "sd_path": "/02/001.mp3",
+                "title": "Second Song",
+                "artist": "Other Artist",
+                "genre": ["Pop"],
+                "duration_sec": 2400,
+                "started_at": first_start + timedelta(hours=3),
+                "ended_at": first_start + timedelta(hours=3, minutes=40),
+                "pause_intervals": [],
+            },
+        ]
+
+        report = build_playback_report(sessions, "daily", now)
+
+        self.assertEqual(report["play_count"], 3)
+        self.assertEqual(report["total_seconds"], 7200)
+        self.assertEqual(report["top_songs"][0]["title"], "First Song")
+        self.assertEqual(report["top_songs"][0]["plays"], 2)
+        self.assertEqual(report["top_genres"], [("Rock", 4800.0), ("Pop", 2400.0)])
+
+    def test_report_counts_only_the_overlap_with_period(self):
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        start, _ = report_period_bounds("daily", now)
+        report = build_playback_report(
+            [
+                {
+                    "song_id": "crossing",
+                    "sd_path": "/01/001.mp3",
+                    "title": "Crossing Song",
+                    "artist": "Artist",
+                    "genre": ["Rock"],
+                    "started_at": start - timedelta(minutes=10),
+                    "ended_at": start + timedelta(minutes=20),
+                    "pause_intervals": [],
+                },
+                {
+                    "song_id": "old",
+                    "sd_path": "/01/002.mp3",
+                    "title": "Old Song",
+                    "artist": "Artist",
+                    "started_at": start - timedelta(hours=2),
+                    "ended_at": start - timedelta(hours=1),
+                    "pause_intervals": [],
+                },
+            ],
+            "daily",
+            now,
+        )
+
+        self.assertEqual(report["play_count"], 1)
+        self.assertEqual(report["total_seconds"], 1200)
+
+    def test_report_excludes_time_after_the_current_open_pause(self):
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        start, _ = report_period_bounds("daily", now)
+        session_start = start - timedelta(minutes=20)
+        report = build_playback_report(
+            [
+                {
+                    "song_id": "paused",
+                    "sd_path": "/01/001.mp3",
+                    "title": "Paused Song",
+                    "artist": "Artist",
+                    "started_at": session_start,
+                    "pause_started_at": start - timedelta(minutes=10),
+                    "pause_intervals": [],
+                }
+            ],
+            "daily",
+            now,
+        )
+
+        self.assertEqual(report["play_count"], 0)
+        self.assertEqual(report["total_seconds"], 0)
+
+    def test_report_caps_an_active_session_at_track_duration(self):
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        start, _ = report_period_bounds("daily", now)
+        session_start = start + timedelta(hours=1)
+        report = build_playback_report(
+            [
+                {
+                    "song_id": "song-a",
+                    "sd_path": "/01/001.mp3",
+                    "title": "First Song",
+                    "artist": "Artist",
+                    "started_at": session_start,
+                    "duration_sec": 180,
+                    "pause_intervals": [],
+                }
+            ],
+            "daily",
+            now,
+        )
+
+        self.assertEqual(report["total_seconds"], 180)
+
+    def test_report_caps_each_song_and_genre_lists_to_requested_top_counts(self):
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        start, _ = report_period_bounds("daily", now)
+        sessions = [
+            {
+                "song_id": str(index),
+                "sd_path": f"/01/{index + 1:03}.mp3",
+                "title": f"Song {index}",
+                "artist": "Artist",
+                "genre": [f"Genre {index}"],
+                "started_at": start + timedelta(hours=index),
+                "ended_at": start + timedelta(hours=index, minutes=1),
+                "pause_intervals": [],
+            }
+            for index in range(8)
+        ]
+
+        report = build_playback_report(sessions, "daily", now)
+
+        self.assertEqual(len(report["top_songs"]), 5)
+        self.assertEqual(len(report["top_genres"]), 3)
+
+    def test_report_returns_zero_totals_when_no_session_matches(self):
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        report = build_playback_report([], "weekly", now)
+
+        self.assertEqual(report["play_count"], 0)
+        self.assertEqual(report["total_seconds"], 0)
+        self.assertEqual(report["top_songs"], [])
+        self.assertEqual(report["top_genres"], [])
+
+    def test_start_closes_previous_session_and_saves_song_metadata(self):
+        collection = Mock()
+        collection.find_one.return_value = {"_id": "previous"}
+        history = PlaybackHistory(collection)
+
+        history.start(
+            {
+                "_id": "song-1",
+                "title": "New Song",
+                "artist": "Artist",
+                "album": "Album",
+                "genre": ["Rock"],
+                "sd_path": "/01/001.mp3",
+                "duration_sec": 200,
+            },
+            user_id=42,
+        )
+
+        self.assertEqual(
+            collection.update_one.call_args.args[0],
+            {"_id": "previous", "ended_at": {"$exists": False}},
+        )
+        document = collection.insert_one.call_args.args[0]
+        self.assertEqual(document["song_id"], "song-1")
+        self.assertEqual(document["user_id"], 42)
+        self.assertEqual(document["duration_sec"], 200)
+        self.assertEqual(document["genre"], ["Rock"])
+        self.assertIsNotNone(document["started_at"].tzinfo)
+
+    def test_pause_and_resume_update_the_active_session(self):
+        collection = Mock()
+        collection.find_one.side_effect = [
+            {"_id": "session-1"},
+            {
+                "_id": "session-1",
+                "pause_started_at": datetime(2026, 11, 10, 12, tzinfo=timezone.utc),
+            },
+        ]
+        collection.update_one.return_value.modified_count = 1
+        history = PlaybackHistory(collection)
+
+        self.assertTrue(history.pause())
+        self.assertIn("pause_started_at", collection.update_one.call_args.args[1]["$set"])
+        self.assertTrue(history.resume())
+        self.assertIn("$push", collection.update_one.call_args.args[1])
+        self.assertEqual(
+            collection.update_one.call_args.args[1]["$unset"],
+            {"pause_started_at": ""},
+        )
+
+    def test_pause_and_resume_return_false_without_matching_session(self):
+        collection = Mock()
+        collection.find_one.return_value = None
+        history = PlaybackHistory(collection)
+
+        self.assertFalse(history.pause())
+        self.assertFalse(history.resume())
+        collection.update_one.assert_not_called()
+
+    def test_start_handles_string_genre_and_missing_duration(self):
+        collection = Mock()
+        collection.find_one.return_value = None
+        history = PlaybackHistory(collection)
+
+        history.start(
+            {
+                "_id": "song-1",
+                "title": "New Song",
+                "artist": "Artist",
+                "genre": "Pop",
+                "sd_path": "/01/001.mp3",
+            },
+            user_id=42,
+        )
+
+        document = collection.insert_one.call_args.args[0]
+        self.assertEqual(document["genre"], ["Pop"])
+        self.assertIsNone(document["duration_sec"])
+
+    def test_report_queries_only_sessions_overlapping_period(self):
+        collection = Mock()
+        collection.find.return_value = []
+        history = PlaybackHistory(collection)
+        now = datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+
+        history.report("daily", now)
+
+        query = collection.find.call_args.args[0]
+        self.assertEqual(
+            query["started_at"]["$lt"],
+            datetime(2026, 11, 11, 3, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            query["$or"][0]["ended_at"]["$gt"],
+            datetime(2026, 11, 10, 3, tzinfo=timezone.utc),
+        )
+
+    def test_report_period_classifier_validates_model_output(self):
+        ai = AIService.__new__(AIService)
+        ai._complete = Mock(return_value='{"period":"weekly"}')
+
+        self.assertEqual(
+            ai.classify_report_period("¿Qué escuché esta semana?"), "weekly"
+        )
+
+        ai._complete.return_value = '{"period":"all_time"}'
+        self.assertIsNone(ai.classify_report_period("muéstrame mis estadísticas"))
+        ai._complete.return_value = '{"period":true}'
+        self.assertIsNone(ai.classify_report_period("mis canciones más escuchadas"))
+
+
+class PlaybackReportCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_natural_language_report_uses_ai_period_and_sends_report(self):
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()))
+        ai = SimpleNamespace(classify_report_period=Mock(return_value="weekly"))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"ai": ai}))
+
+        with patch("app.bot.send_playback_report", new_callable=AsyncMock) as send:
+            handled = await _try_natural_language_report(
+                update, context, "¿Qué escuché esta semana?"
+            )
+
+        self.assertTrue(handled)
+        send.assert_awaited_once_with(update, context, "weekly")
+        ai.classify_report_period.assert_called_once_with("¿Qué escuché esta semana?")
+
+    async def test_non_report_text_skips_ai_classification(self):
+        ai = SimpleNamespace(classify_report_period=Mock())
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"ai": ai}))
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()))
+
+        handled = await _try_natural_language_report(
+            update, context, "Recomiéndame canciones movidas."
+        )
+
+        self.assertFalse(handled)
+        ai.classify_report_period.assert_not_called()
+
+    async def test_report_command_defaults_to_daily_period(self):
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(reply_text=AsyncMock())
+        )
+        context = SimpleNamespace(args=[])
+
+        with patch("app.bot.send_playback_report", new_callable=AsyncMock) as send:
+            await reports_command(update, context)
+
+        send.assert_awaited_once_with(update, context, "daily")
+
+    async def test_report_command_rejects_unknown_period(self):
+        reply = AsyncMock()
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply))
+        context = SimpleNamespace(args=["mensual"])
+
+        with patch("app.bot.send_playback_report", new_callable=AsyncMock) as send:
+            await reports_command(update, context)
+
+        reply.assert_awaited_once()
+        self.assertIn("Uso:", reply.await_args.args[0])
+        send.assert_not_awaited()
+
+    async def test_report_command_accepts_weekly_alias(self):
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(reply_text=AsyncMock())
+        )
+        context = SimpleNamespace(args=["semana"])
+
+        with patch("app.bot.send_playback_report", new_callable=AsyncMock) as send:
+            await reports_command(update, context)
+
+        send.assert_awaited_once_with(update, context, "weekly")
+
+    async def test_report_command_accepts_daily_alias(self):
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(reply_text=AsyncMock())
+        )
+        context = SimpleNamespace(args=["hoy"])
+
+        with patch("app.bot.send_playback_report", new_callable=AsyncMock) as send:
+            await reports_command(update, context)
+
+        send.assert_awaited_once_with(update, context, "daily")
+
+    async def test_natural_language_request_without_report_intent_falls_through(self):
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()))
+        ai = SimpleNamespace(classify_report_period=Mock(return_value=None))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"ai": ai}))
+
+        handled = await _try_natural_language_report(
+            update, context, "Muéstrame mis canciones más escuchadas."
+        )
+
+        self.assertFalse(handled)
+        ai.classify_report_period.assert_called_once()
+
+    async def test_natural_language_request_reports_ai_failure_with_command_fallback(self):
+        reply = AsyncMock()
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply))
+        ai = SimpleNamespace(classify_report_period=Mock(side_effect=RuntimeError("AI down")))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"ai": ai}))
+
+        with self.assertLogs("app.bot", level="ERROR"):
+            handled = await _try_natural_language_report(
+                update, context, "¿Qué escuché esta semana?"
+            )
+
+        self.assertTrue(handled)
+        self.assertIn("/reportes diario", reply.await_args.args[0])
+
+    async def test_send_report_surfaces_database_failure(self):
+        reply = AsyncMock()
+        update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply))
+        history = SimpleNamespace(report=Mock(side_effect=PyMongoError("database down")))
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"playback_history": history})
+        )
+
+        with self.assertLogs("app.bot", level="ERROR"):
+            await send_playback_report(update, context, "daily")
+
+        self.assertIn("MongoDB", reply.await_args.args[0])
+
+    def test_report_format_escapes_song_metadata(self):
+        start, end = report_period_bounds(
+            "daily", datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        )
+        text = _format_playback_report(
+            {
+                "period": "daily",
+                "start": start,
+                "end": end,
+                "play_count": 1,
+                "total_seconds": 65,
+                "top_songs": [
+                    {
+                        "title": "<Song>",
+                        "artist": "Artist & Co",
+                        "plays": 1,
+                        "seconds": 65,
+                    }
+                ],
+                "top_genres": [("<Rock>", 65)],
+            }
+        )
+
+        self.assertIn("&lt;Song&gt;", text)
+        self.assertIn("Artist &amp; Co", text)
+        self.assertIn("&lt;Rock&gt;", text)
+        self.assertNotIn("<Song>", text)
+
+    def test_empty_report_format_explains_that_no_plays_are_available(self):
+        start, end = report_period_bounds(
+            "weekly", datetime(2026, 11, 10, 20, tzinfo=timezone.utc)
+        )
+        text = _format_playback_report(
+            {
+                "period": "weekly",
+                "start": start,
+                "end": end,
+                "play_count": 0,
+                "total_seconds": 0,
+                "top_songs": [],
+                "top_genres": [],
+            }
+        )
+
+        self.assertIn("Informe semanal", text)
+        self.assertIn("Todavía no hay reproducciones", text)
 
 
 class DFPlayerProtocolTests(unittest.TestCase):

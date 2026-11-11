@@ -7,9 +7,11 @@ Todo este prototipo vive en esta carpeta; no modifica el código de las otras ca
 ## Qué hace
 
 - Recibe texto y el comando `/buscar` en Telegram.
+- Acepta mensajes de voz de hasta 20 MB, los transcribe en español con el modelo configurable `AI_TRANSCRIPTION_MODEL` y procesa la transcripción con el mismo flujo de texto.
 - Añade botones explícitos de reproducción a canciones recomendadas que tengan una ruta `sd_path` válida en MongoDB.
 - Después de hablar de una canción concreta, pregunta si quieres reproducirla cuando exista en la biblioteca con una ruta SD válida.
 - Incluye controles para pausar y reanudar la reproducción desde Telegram (`/pausar`, `/reanudar` o el botón debajo de la confirmación de reproducción).
+- Guarda en MongoDB las sesiones de reproducción iniciadas desde el bot, incluidos título, artista, género, fecha/hora y pausas, y ofrece informes diarios/semanales con `/reportes` o pedidos en lenguaje natural.
 - Recuerda la última canción reproducida durante la sesión del bot; “otra vez” ofrece reproducirla de nuevo. Si el bot se reinició y perdió ese contexto, pide el título en vez de adivinar.
 - Envía al ESP32 únicamente la ruta obtenida de MongoDB y validada; la IA no genera comandos ni rutas para el hardware.
 - Responde como asistente conversacional sobre artistas, canciones, géneros e historia musical, con hasta seis intercambios recientes de contexto por usuario. Usa `/reset` para iniciar de nuevo. Los saludos no activan Tavily; la búsqueda web en el chat queda para preguntas que piden explícitamente información actual o noticias.
@@ -55,6 +57,8 @@ La integración usa una API compatible con OpenAI; `AI_MODEL`, `AI_BASE_URL` y `
 | Otro compatible | Según el proveedor | URL base de su API compatible | Clave del proveedor |
 
 El servicio elegido por `AI_BASE_URL` y `AI_MODEL` tiene que aceptar llamadas de chat completions. Azure OpenAI y algunos proveedores pueden requerir un adaptador específico de autenticación; no se asume compatibilidad automática.
+
+La transcripción de voz usa `AI_TRANSCRIPTION_MODEL` mediante el endpoint de transcripciones compatible con OpenAI, compartiendo `AI_BASE_URL` y `AI_API_KEY`. El proveedor configurado debe admitir ese endpoint y el formato OGG de Telegram; OpenAI utiliza `whisper-1`. El audio y su transcripción se envían al proveedor configurado y no se guardan en MongoDB. Si el proveedor no admite audio, puedes seguir usando el bot por texto.
 
 ### Búsqueda en Internet (opcional)
 
@@ -138,6 +142,36 @@ python -m scripts.index_sd_card --sd-root E:\
 
 El indexador asocia cada MP3 a la canción existente por sus etiquetas ID3 y agrega `sd_path`, `dfplayer_folder` y `dfplayer_track`. Si no encuentra una canción equivalente, la crea en MongoDB. Omite rutas/nombres incompatibles o archivos sin etiquetas legibles. No copia ni renombra archivos.
 
+#### Completar años y géneros con MusicBrainz
+
+La biblioteca local puede tener fechas ID3 incorrectas (por ejemplo, `1970`) o no tener género. El script consulta MusicBrainz usando artista y álbum, valida coincidencias exactas y muestra una vista previa sin escribir cambios:
+
+```powershell
+python -m scripts.enrich_metadata
+```
+
+Solo después de revisar la salida, aplica las coincidencias con:
+
+```powershell
+python -m scripts.enrich_metadata --apply
+```
+
+El script reemplaza `1970` como año no fiable, calcula `decade` a partir de la primera publicación del álbum y agrega solo géneros de una lista conocida que tengan respaldo suficiente en las etiquetas comunitarias. Exige coincidencias claras de artista, título y tipo de álbum; no sobrescribe años válidos ni géneros existentes. MongoDB conserva `year_source`, `genre_source`, `metadata_confidence` y el identificador de MusicBrainz para rastrear el origen. Requiere Internet; consulta la API pública de MusicBrainz respetando su límite de solicitudes. No cambia etiquetas de audio ni escribe en la microSD.
+
+#### Organizar una biblioteca completa
+
+`scripts.organize_sd_library` crea una vista previa por defecto. Agrupa la música por artista y álbum en carpetas numéricas, mantiene Persona en `02` y conserva las pistas Persona ya presentes en la tarjeta si también están en la descarga. Los nueve temas Deftones sin etiquetas se identifican por nombre de archivo y se guardan sin álbum; no se modifican los MP3 originales de descargas. Los años ID3 `1970` no se consideran fechas de lanzamiento.
+
+Para preparar una copia local lista para transferir, usa `--prepare-output`. Esto lee las canciones actuales de la tarjeta para conservar las pistas que no están en Descargas, pero escribe el resultado únicamente en la carpeta local indicada:
+
+```powershell
+python -m scripts.organize_sd_library --source-root "C:\Users\Admin\Downloads\Musica\Musica" --sd-root D:\ --prepare-output "C:\Users\Admin\Desktop\Musica organizada para microSD"
+```
+
+Abre la carpeta de salida y sigue `LEEME.txt`: quita primero las carpetas numéricas antiguas de la tarjeta y copia las carpetas numéricas preparadas directamente a la raíz de la microSD. No copies la carpeta contenedora como subcarpeta. `MP3-library.csv` es un índice opcional, no hace falta para reproducir. Una vez copiados los archivos, vuelve a indexar MongoDB para actualizar las rutas.
+
+La opción `--apply` copia directamente y reemplaza las carpetas numéricas de la tarjeta, además de actualizar MongoDB; úsala solo con una tarjeta estable y tras revisar la vista previa. Nunca formatea la tarjeta ni altera la carpeta de descargas.
+
 ### Configurar el ESP32 y DFPlayer Mini
 
 1. Instala MicroPython en el ESP32 y copia `esp32_firmware/main.py`, `esp32_firmware/dfplayer.py`, `esp32_firmware/protocol.py` y una copia de `esp32_firmware/config.py.example` renombrada a `config.py`.
@@ -177,12 +211,14 @@ python run_bot.py
 En Telegram prueba:
 
 - `dame canciones movidas`
+- Envía un mensaje de voz diciendo, por ejemplo, «buenos hits de los 80».
 - `buenos hits de los 80`
 - `canciones de Queen`
 - `¿Qué te parece Purple Rain?` (si está indexada con una ruta SD, ofrecerá reproducirla)
 - `me gustaría que me reproduzcas esa canción` (resuelve referencias recientes y ofrece el botón si el tema está indexado)
 - `/buscar rock argentino de los 90`
 - `/pausar` y `/reanudar`
+- `/reportes diario` y `/reportes semanal`, o pregunta “¿Qué escuché esta semana?” / “¿Cuánto escuché hoy?”
 
 El bot también ofrece `/start` y `/help`. Si no hay resultados, comprueba los metadatos de la colección, el nombre de la base y el de la colección.
 
@@ -208,6 +244,7 @@ proyecto_telegram_ai_music/
 │   ├── config.py
 │   ├── database.py
 │   ├── device_client.py
+│   ├── playback_history.py
 │   ├── recommender.py
 │   └── sd_path.py
 ├── esp32_firmware/
@@ -216,7 +253,9 @@ proyecto_telegram_ai_music/
 │   ├── main.py
 │   └── protocol.py
 ├── scripts/
+│   ├── enrich_metadata.py
 │   ├── index_sd_card.py
+│   ├── organize_sd_library.py
 │   ├── seed_80s.py
 │   └── seed_alternative_rock.py
 └── tests/
@@ -228,5 +267,7 @@ proyecto_telegram_ai_music/
 - La calidad depende de los metadatos disponibles en la biblioteca local; la IA no analiza el audio ni calcula BPM.
 - La consulta web es optativa y requiere una cuenta/clave de Tavily. El modelo no obtiene acceso general a Internet por sí mismo.
 - El historial conversacional se mantiene en memoria del proceso y se pierde al reiniciar el bot; no se guarda en MongoDB.
-- Este prototipo todavía no registra historial de reproducción ni incluye `/reportes` o comandos específicos como `/top80`; esos extras del proyecto se pueden integrar después sobre la misma base.
+- El historial registra las órdenes de reproducción aceptadas por el ESP32, no confirma que el usuario haya oído el audio ni detecta el final real de cada pista. El tiempo se estima con pausas/reanudaciones y la duración del archivo MP3.
+- Los informes cuentan solo reproducciones registradas desde que está instalada esta función; no hay datos retroactivos.
+- Los géneros de muchas canciones no están etiquetados. Los informes solo agrupan por género cuando existe ese dato; el indexador guarda la duración del MP3 para limitar el tiempo estimado de escucha.
 - Para un despliegue real, añade controles de acceso al bot, gestión segura de claves, límites de uso y pruebas de integración con una instancia de MongoDB.

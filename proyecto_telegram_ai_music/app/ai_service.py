@@ -57,6 +57,28 @@ class AIService:
             timeout=settings.ai_timeout_seconds,
         )
 
+    def transcribe_audio(self, audio: bytes, filename: str = "voice.ogg") -> str:
+        if not audio:
+            raise ValueError("El archivo de audio está vacío.")
+        try:
+            response = self.client.audio.transcriptions.create(
+                model=self.settings.ai_transcription_model,
+                file=(filename, audio, "audio/ogg"),
+                language="es",
+            )
+        except RateLimitError as exc:
+            if _is_quota_error(exc):
+                raise AIQuotaExceededError(
+                    "El proveedor de IA no tiene créditos disponibles."
+                ) from exc
+            raise AIRateLimitError(
+                "El proveedor de IA está limitando temporalmente las solicitudes."
+            ) from exc
+        text = getattr(response, "text", "")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("El proveedor no devolvió una transcripción.")
+        return text.strip()
+
     def _complete(self, system: str, user: str) -> str:
         try:
             response = self.client.chat.completions.create(
@@ -126,6 +148,22 @@ class AIService:
             else self.settings.ai_top_results
         )
         return filters
+
+    def classify_report_period(self, request_text: str) -> str | None:
+        raw = _json_from_text(
+            self._complete(
+                "Determina si el usuario pide un informe de su historial real de "
+                "reproducciones. No confundas una recomendación o una pregunta "
+                "musical general con un informe. Devuelve solo JSON válido: "
+                '{"period":"daily"}, {"period":"weekly"} o {"period":null}. '
+                "Usa daily para hoy, diario o si pide un informe sin período; "
+                "weekly para esta semana, semanal o los últimos siete días. "
+                "No inventes cifras ni respondas el informe.",
+                request_text,
+            )
+        )
+        period = raw.get("period")
+        return period if isinstance(period, str) and period in {"daily", "weekly"} else None
 
     def rank_songs(
         self, request_text: str, candidates: list[dict], web_context: str = ""
