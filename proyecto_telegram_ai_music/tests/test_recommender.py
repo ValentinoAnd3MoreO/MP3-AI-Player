@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import requests
 from pymongo.errors import PyMongoError
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 from app.ai_service import AIService, _is_quota_error
 from app.bot import (
@@ -56,7 +57,7 @@ from app.recommender import (
 from app.sd_path import parse_sd_path
 from scripts.index_sd_card import index_sd_card
 from scripts.organize_sd_library import _infer_deftones_title
-from esp32_firmware.protocol import build_frame, extract_finished_events
+from esp32_firmware.protocol import build_frame, extract_finished_events, extract_frames
 from scripts.seed_alternative_rock import (
     ALTERNATIVE_ROCK,
     build_documents as build_alternative_rock_documents,
@@ -370,6 +371,77 @@ class BuildMongoQueryTests(unittest.TestCase):
 
 
 class VoiceMessageTests(unittest.IsolatedAsyncioTestCase):
+    def _voice_download_context(self):
+        message = SimpleNamespace(
+            voice=SimpleNamespace(file_id="telegram-file", file_size=100),
+            chat=SimpleNamespace(send_action=AsyncMock()),
+            reply_text=AsyncMock(),
+        )
+        audio_file = SimpleNamespace(
+            download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg-data"))
+        )
+        ai = SimpleNamespace(transcribe_audio=Mock(return_value="poneme rock"))
+        context = SimpleNamespace(
+            bot=SimpleNamespace(get_file=AsyncMock(return_value=audio_file)),
+            application=SimpleNamespace(bot_data={"ai": ai}),
+        )
+        return SimpleNamespace(effective_message=message), context, audio_file, ai
+
+    async def test_voice_download_retries_transient_errors_before_processing_once(self):
+        for stage in ("get_file", "download"):
+            with self.subTest(stage=stage):
+                update, context, audio_file, ai = self._voice_download_context()
+                if stage == "get_file":
+                    context.bot.get_file.side_effect = [NetworkError("offline"), audio_file]
+                else:
+                    audio_file.download_as_bytearray.side_effect = [
+                        TimedOut(), bytearray(b"ogg-data")
+                    ]
+                with (
+                    patch("app.bot.asyncio.sleep", new_callable=AsyncMock) as sleep,
+                    patch("app.bot.process_text_message", new_callable=AsyncMock) as route,
+                ):
+                    await voice_message(update, context)
+
+                self.assertEqual(context.bot.get_file.await_count, 2)
+                self.assertEqual(
+                    context.bot.get_file.await_args.kwargs,
+                    {"read_timeout": 30, "connect_timeout": 10},
+                )
+                audio_file.download_as_bytearray.assert_awaited_with(
+                    read_timeout=30, connect_timeout=10
+                )
+                sleep.assert_awaited_once_with(1)
+                ai.transcribe_audio.assert_called_once_with(b"ogg-data", "voice.ogg")
+                route.assert_awaited_once_with(update, context, "poneme rock")
+
+    async def test_voice_timeout_stops_after_three_attempts_without_transcription(self):
+        update, context, audio_file, ai = self._voice_download_context()
+        audio_file.download_as_bytearray.side_effect = TimedOut()
+        with (
+            patch("app.bot.asyncio.sleep", new_callable=AsyncMock) as sleep,
+            patch("app.bot.process_text_message", new_callable=AsyncMock) as route,
+        ):
+            await voice_message(update, context)
+
+        self.assertEqual(audio_file.download_as_bytearray.await_count, 3)
+        self.assertEqual(sleep.await_count, 2)
+        ai.transcribe_audio.assert_not_called()
+        route.assert_not_awaited()
+        self.assertIn("3 intentos", update.effective_message.reply_text.await_args.args[0])
+
+    async def test_voice_bad_request_is_not_retried(self):
+        update, context, audio_file, ai = self._voice_download_context()
+        context.bot.get_file.side_effect = BadRequest("invalid file id")
+        with patch("app.bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await voice_message(update, context)
+
+        context.bot.get_file.assert_awaited_once()
+        sleep.assert_not_awaited()
+        audio_file.download_as_bytearray.assert_not_awaited()
+        ai.transcribe_audio.assert_not_called()
+        update.effective_message.reply_text.assert_awaited_once()
+
     async def test_transcribes_voice_and_routes_transcript_through_text_flow(self):
         message = Mock()
         message.voice.file_id = "telegram-file"
@@ -2410,6 +2482,47 @@ class PlaybackReportCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DFPlayerProtocolTests(unittest.TestCase):
+    def test_extracts_frames_without_bytearray_deletion_or_clear(self):
+        class MicroPythonBuffer(bytearray):
+            def __delitem__(self, key):
+                raise TypeError("'bytearray' object doesn't support item deletion")
+
+            def clear(self):
+                raise AttributeError("'bytearray' object has no attribute 'clear'")
+
+        finished = build_frame(0x3D, 1)
+        status = build_frame(0x42, 2)
+        partial = finished[:5]
+        cases = [
+            (b"", [], b""),
+            (b"noise", [], b""),
+            (finished, [finished], b""),
+            (b"noise" + finished + status + partial, [finished, status], partial),
+            (finished[:-1] + b"\x00" + status, [status], b""),
+            (b"\x7e\x00" + finished[2:] + status, [status], b""),
+            (finished[:2] + b"\x00" + finished[3:] + status, [status], b""),
+        ]
+        for data, expected_frames, remaining in cases:
+            with self.subTest(data=data):
+                buffer = MicroPythonBuffer(data)
+
+                self.assertEqual(extract_frames(buffer), expected_frames)
+                self.assertEqual(buffer, remaining)
+
+    def test_keeps_partial_frames_until_next_uart_read(self):
+        frame = build_frame(0x3D, 2)
+        for split in range(1, len(frame)):
+            with self.subTest(split=split):
+                buffer = bytearray(b"noise" + frame[:split])
+
+                self.assertEqual(extract_frames(buffer), [])
+                self.assertEqual(buffer, frame[:split])
+
+                buffer.extend(frame[split:])
+
+                self.assertEqual(extract_frames(buffer), [frame])
+                self.assertEqual(buffer, b"")
+
     def test_extracts_finished_notifications_and_keeps_partial_frame(self):
         buffer = bytearray(
             b"noise"

@@ -7,9 +7,10 @@ Todo este prototipo vive en esta carpeta; no modifica el código de las otras ca
 ## Qué hace
 
 - Recibe texto y el comando `/buscar` en Telegram.
-- Acepta mensajes de voz de hasta 20 MB, los transcribe en español con el modelo configurable `AI_TRANSCRIPTION_MODEL` y procesa la transcripción con el mismo flujo de texto.
+- Acepta mensajes de voz de hasta 20 MB, los transcribe en español con el modelo configurable `AI_TRANSCRIPTION_MODEL` y procesa la transcripción con el mismo flujo de texto. La descarga desde Telegram usa 30 segundos de espera de lectura y 10 de conexión, con hasta 3 intentos ante timeouts o fallos de red y pausas de 1 y 2 segundos entre intentos. Si no puede descargarla, avisa y no ejecuta el pedido; los reintentos no repiten la transcripción ni la reproducción.
 - Añade botones explícitos de reproducción a canciones recomendadas que tengan una ruta `sd_path` válida en MongoDB. Tras conversar sobre una canción o mencionar claramente un álbum, comprueba la disponibilidad en MongoDB y ofrece reproducir la canción o encolar el álbum completo.
 - `/autoplay on|off` activa o desactiva por usuario el inicio automático, apagado por defecto. Cuando está activo, un pedido explícito como «quiero escuchar Purple Rain» o «poneme hits movidos» inicia la mejor coincidencia local reproducible sin pedir confirmación; las alternativas («poneme otra») y la conversación normal no disparan autoplay. `/autoplay` muestra el estado. La preferencia se guarda en MongoDB y sobrevive a los reinicios.
+- Para encolar una selección completa, pide «poneme 10 canciones de Charly García en la cola» o «quiero escuchar 10 canciones de Queen». Con autoplay activado agrega todas las coincidencias reproducibles seleccionadas, no solo la primera; con autoplay apagado muestra un único botón para confirmar toda la selección. Si ya suena una canción, la conserva y añade las nuevas al final; si la cola está vacía, inicia la primera y deja las demás pendientes. Si hay menos canciones reproducibles de las solicitadas, informa la cantidad disponible. Pedir solo recomendaciones («dame 10 canciones de Queen») no inicia la reproducción.
 - Si pides escuchar un tema que no está indexado, explica que el reproductor funciona con canciones de la microSD y que falta ese tema concreto, en vez de afirmar que el bot no puede reproducir música.
 - Después de hablar de una canción concreta, ofrece reproducirla cuando exista en la biblioteca con una ruta SD válida. La sugerencia por coincidencia se basa en el mensaje actual, no en canciones mencionadas en conversaciones anteriores; para referencias como «esa canción» el modelo debe resolver el tema explícitamente desde el contexto. Evita sugerencias por coincidencias accidentales con palabras comunes: los títulos de una sola palabra requieren mencionar también al artista.
 - Si se habla de Persona como videojuego, no lo interpreta como una banda; si no queda claro qué entrega o banda sonora se busca, pide una aclaración.
@@ -214,6 +215,8 @@ El PC del bot y el ESP32 deben poder comunicarse en la misma red local. El endpo
 Luego reinicia el bot, indexa la tarjeta y pide una canción. El bot ofrece un botón **Reproducir** para los resultados que tienen `sd_path`; la reproducción ocurre solo cuando lo pulsas. Las canciones de catálogo de prueba no tienen MP3 ni ruta SD hasta que indexas audio real.
 
 Al actualizar el firmware del ESP32, copia de nuevo tanto `main.py` como `dfplayer.py` (además de los otros archivos si cambiaron). Al pulsar reproducir, la consola serie muestra la respuesta UART del DFPlayer. La aceptación HTTP solo confirma que recibió la solicitud de red; no garantiza que haya empezado a reproducir.
+
+Si Thonny muestra `TypeError: 'bytearray' object doesn't support item deletion` en `extract_frames`, copia el `esp32_firmware/protocol.py` actualizado a la raíz del ESP32 como `protocol.py` y reinicia la placa. El parser usa asignación de segmentos en lugar de `del` o `clear()` para ser compatible con MicroPython; no hace falta reinstalar MicroPython ni cambiar el cableado.
 
 ### Volumen y calidad de audio
 

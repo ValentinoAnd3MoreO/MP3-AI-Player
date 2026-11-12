@@ -15,10 +15,167 @@ from app.bot import (
     clear_upcoming_queue_request,
     keep_queue_matching_request,
     jump_to_queued_song,
+    play_album_suggestion_callback,
+    process_text_message,
     stop_playback_request,
+    voice_message,
 )
 from app.database import SongDatabase
 from app.playback_queue import PlaybackQueue
+from app.playback_state import PlaybackStateStore
+
+
+class RecommendationQueueTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.songs = [
+            {
+                "_id": str(index),
+                "title": f"Song {index}",
+                "artist": "Charly García",
+                "sd_path": f"/01/{index:03d}.mp3",
+            }
+            for index in range(1, 11)
+        ]
+        self.queue = PlaybackQueue()
+        self.device = Mock()
+        self.collection = Mock()
+        self.user_data = {"autoplay_enabled": True}
+        self.message = SimpleNamespace(
+            chat=SimpleNamespace(send_action=AsyncMock()),
+            chat_id=100,
+            reply_text=AsyncMock(),
+        )
+        self.update = SimpleNamespace(
+            message=self.message,
+            effective_message=self.message,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=100),
+        )
+        self.context = SimpleNamespace(
+            application=SimpleNamespace(
+                user_data={42: self.user_data},
+                bot_data={
+                    "recommender": SimpleNamespace(
+                        recommend=Mock(return_value=(self.songs, False))
+                    ),
+                    "database": SimpleNamespace(
+                        find_songs_by_ids=Mock(return_value=self.songs)
+                    ),
+                    "playback_queue": self.queue,
+                    "playback_state": PlaybackStateStore(self.collection),
+                    "playback_history": Mock(),
+                    "player_settings": SimpleNamespace(player_enabled=True),
+                    "device": self.device,
+                },
+            ),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            user_data=self.user_data,
+        )
+        self.request = (
+            "Ahora quiero escuchar canciones de Charlie García, poneme 10 canciones "
+            "de Charlie García en la cola de reproducción."
+        )
+
+    async def test_voice_request_enqueues_all_ten_and_skip_plays_second(self):
+        self.message.voice = SimpleNamespace(file_id="voice", file_size=100)
+        self.context.bot.get_file = AsyncMock(
+            return_value=SimpleNamespace(
+                download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg"))
+            )
+        )
+        self.context.application.bot_data["ai"] = SimpleNamespace(
+            transcribe_audio=Mock(return_value=self.request)
+        )
+
+        await voice_message(self.update, self.context)
+
+        self.assertEqual(self.queue.songs, self.songs)
+        self.assertEqual(len(self.queue.upcoming), 9)
+        self.device.play.assert_called_once_with(self.songs[0]["sd_path"])
+        saved = self.collection.update_one.call_args.args[1]["$set"]["song_ids"]
+        self.assertEqual(saved, [song["_id"] for song in self.songs])
+
+        await _advance_playlist(self.context, chat_id=100, user_id=42)
+
+        self.assertEqual(self.queue.current, self.songs[1])
+        self.device.play.assert_called_with(self.songs[1]["sd_path"])
+
+    async def test_queue_request_appends_without_interrupting_existing_song(self):
+        current = {"_id": "current", "sd_path": "/02/001.mp3"}
+        future = {"_id": "future", "sd_path": "/02/002.mp3"}
+        self.queue.enqueue([current, future])
+
+        await process_text_message(self.update, self.context, self.request)
+
+        self.assertIs(self.queue.current, current)
+        self.assertEqual(self.queue.upcoming, [future] + self.songs)
+        self.device.play.assert_not_called()
+        self.assertIn("Añadí 10", self.message.reply_text.await_args.args[0])
+
+    async def test_autoplay_off_offers_whole_selection_and_confirmation_enqueues_it(self):
+        self.user_data["autoplay_enabled"] = False
+        for _ in range(2):
+            await process_text_message(self.update, self.context, self.request)
+
+        self.assertIsNone(self.queue.current)
+        self.device.play.assert_not_called()
+        keyboard = self.message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertEqual(len(keyboard.inline_keyboard), 1)
+        button = keyboard.inline_keyboard[0][0]
+        token = button.callback_data.partition(":")[2]
+        self.assertEqual(
+            self.user_data["pending_album"][token], [s["_id"] for s in self.songs]
+        )
+        self.update.callback_query = SimpleNamespace(
+            data=button.callback_data, answer=AsyncMock(), message=self.message
+        )
+
+        await play_album_suggestion_callback(self.update, self.context)
+
+        self.assertEqual(self.queue.songs, self.songs)
+        self.device.play.assert_called_once_with(self.songs[0]["sd_path"])
+
+    async def test_reports_shortfall_and_only_enqueues_playable_results(self):
+        self.songs[0].pop("sd_path")
+        self.songs[1]["sd_path"] = "/01/999.mp3"
+
+        await process_text_message(self.update, self.context, self.request)
+
+        self.assertEqual(self.queue.songs, self.songs[2:])
+        messages = "\n".join(
+            call.args[0] for call in self.message.reply_text.await_args_list
+        )
+        self.assertIn("8 de las 10", messages)
+
+    async def test_numbered_playback_request_without_queue_word_enqueues_all(self):
+        await process_text_message(
+            self.update, self.context, "quiero escuchar 10 canciones de Queen"
+        )
+        self.assertEqual(self.queue.songs, self.songs)
+
+    async def test_recommendation_only_or_disabled_player_does_not_enqueue(self):
+        await process_text_message(
+            self.update, self.context, "dame 10 canciones de Queen"
+        )
+        self.assertIsNone(self.queue.current)
+        self.context.application.bot_data["player_settings"].player_enabled = False
+        await process_text_message(self.update, self.context, self.request)
+        self.assertIsNone(self.queue.current)
+        self.device.play.assert_not_called()
+
+    async def test_explicit_add_request_works_without_song_or_playback_words(self):
+        await process_text_message(
+            self.update, self.context, "agregá Queen a la cola"
+        )
+        self.assertEqual(self.queue.songs, self.songs)
+
+    async def test_negated_add_request_leaves_queue_unchanged(self):
+        await process_text_message(
+            self.update, self.context, "no agregues canciones de Queen a la cola"
+        )
+        self.assertIsNone(self.queue.current)
+        self.device.play.assert_not_called()
+        self.context.application.bot_data["recommender"].recommend.assert_not_called()
 
 
 class PlaybackQueueTests(unittest.TestCase):

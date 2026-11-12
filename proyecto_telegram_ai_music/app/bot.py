@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import requests
-from telegram.error import TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -99,9 +99,16 @@ _QUEUE_CLEAR_REQUEST = re.compile(
     r".{0,100}\b(?:toda?\s+)?(?:la\s+)?cola\b",
     re.IGNORECASE,
 )
+_QUEUE_ADD_REQUEST = re.compile(
+    r"\bencol\w*\b"
+    r"|\b(?:pon\w*|a[nñ]ad\w*|agreg\w*)\b.{0,160}\bcola\b"
+    r"|\bcola\b.{0,160}\b(?:pon\w*|a[nñ]ad\w*|agreg\w*)\b",
+    re.IGNORECASE,
+)
 _NEGATED_QUEUE_CHANGE_REQUEST = re.compile(
     r"\b(?:no|nunca)\s+(?:me\s+)?"
-    r"(?:borr\w*|elimin\w*|limpi\w*|vac[ií]\w*|quit\w*)\b"
+    r"(?:borr\w*|elimin\w*|limpi\w*|vac[ií]\w*|quit\w*|"
+    r"a[nñ]ad\w*|agreg\w*|encol\w*|pong\w*|pon\w*)\b"
     r".{0,120}\bcola\b",
     re.IGNORECASE,
 )
@@ -259,6 +266,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /autoplay on|off — reproduce directamente los pedidos explícitos "
         "o pide confirmación. Está apagado por defecto.\n\n"
         "COLA Y ÁLBUMES\n"
+        "• «Poneme 10 canciones de Charly García en la cola» — agrega toda "
+        "la selección; con autoplay apagado, confirma con un único botón.\n"
         "• /cola — muestra la canción actual y las siguientes.\n"
         "• /skip — salta a la próxima; /skip Título salta a esa canción futura.\n"
         "• /loop — alterna entre no repetir, repetir la cola y repetir la canción.\n"
@@ -542,6 +551,14 @@ def _initialize_autoplay_preference(
 async def recommend_text(
     request_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if (
+        update.effective_user is None
+        or update.effective_chat is None
+        or update.message is None
+        or update.effective_message is None
+    ):
+        logger.warning("No se puede recomendar sin un mensaje, usuario y chat válidos.")
+        return
     recommender: Recommender = context.application.bot_data["recommender"]
     user_data = context.application.user_data[update.effective_user.id]
     _initialize_autoplay_preference(
@@ -618,32 +635,61 @@ async def recommend_text(
         (
             _PLAYBACK_REQUEST.search(request_text)
             or _AUTOPLAY_REQUEST.search(request_text)
+            or _QUEUE_ADD_REQUEST.search(request_text)
         )
         and not asking_for_alternative
     )
+    requested_count = requested_song_count(request_text)
+    queue_selection = user_wants_playback and bool(
+        _QUEUE_ADD_REQUEST.search(request_text)
+        or (requested_count is not None and requested_count > 1)
+    )
+    playable_songs = [song for song in songs if parse_sd_path(song.get("sd_path"))]
+    if queue_selection and requested_count:
+        playable_songs = playable_songs[:requested_count]
     autoplay_enabled = bool(user_data.get("autoplay_enabled", False))
     player_enabled = context.application.bot_data["player_settings"].player_enabled
+    autoplay_selection = bool(
+        queue_selection and playable_songs and autoplay_enabled and player_enabled
+    )
     autoplay_song = (
-        next((song for song in songs if parse_sd_path(song.get("sd_path"))), None)
-        if user_wants_playback and autoplay_enabled and player_enabled
+        next(iter(playable_songs), None)
+        if user_wants_playback and not queue_selection
+        and autoplay_enabled and player_enabled
         else None
     )
     message = "\n".join(
         _format_song(song, index) for index, song in enumerate(songs, 1)
     )
-    keyboard = (
-        None
-        if autoplay_song
-        else _play_keyboard(songs, context, update.effective_user.id)
-    )
-    if autoplay_song:
+    if autoplay_song or autoplay_selection:
+        keyboard = None
         user_data.setdefault("pending_play", {}).clear()
+    elif queue_selection and playable_songs and player_enabled:
+        button = _queue_selection_button(
+            playable_songs, "la selección solicitada", context, update.effective_user.id
+        )
+        keyboard = InlineKeyboardMarkup([[button]])
+        user_data.setdefault("pending_play", {}).clear()
+    else:
+        keyboard = _play_keyboard(songs, context, update.effective_user.id)
     has_sd_paths = any(parse_sd_path(song.get("sd_path")) for song in songs)
-    if autoplay_song:
+    if queue_selection and requested_count and len(playable_songs) < requested_count:
+        message += (
+            f"\n\nSolo encontré {len(playable_songs)} de las {requested_count} "
+            "canciones solicitadas con ruta válida en la microSD."
+        )
+    if autoplay_selection:
+        message += (
+            "\n\nReproducción automática activada: añadiré la selección completa "
+            "reproducible a la cola, sin interrumpir la canción actual."
+        )
+    elif autoplay_song:
         message += (
             "\n\nReproducción automática activada: iniciaré la mejor coincidencia "
             "disponible en tu microSD."
         )
+    elif keyboard and queue_selection:
+        message += "\n\nConfirma para añadir toda la selección a la cola:"
     elif keyboard:
         message += "\n\nToca una canción para reproducirla en el ESP32:"
     elif not has_sd_paths:
@@ -656,7 +702,16 @@ async def recommend_text(
     await update.message.reply_text(
         message, parse_mode=ParseMode.HTML, reply_markup=keyboard
     )
-    if autoplay_song:
+    if autoplay_selection:
+        await _enqueue_album_songs(
+            playable_songs,
+            "la selección solicitada",
+            context,
+            update.effective_user.id,
+            update.effective_chat.id,
+            update.effective_message,
+        )
+    elif autoplay_song:
         await _play_song_immediately(
             autoplay_song,
             context,
@@ -702,6 +757,21 @@ def _play_keyboard(
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def _queue_selection_button(
+    songs: list[dict],
+    label: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+) -> InlineKeyboardButton:
+    user_data = context.application.user_data[user_id]
+    token = uuid.uuid4().hex[:16]
+    user_data.setdefault("pending_album", {})[token] = [str(song["_id"]) for song in songs]
+    user_data.setdefault("pending_album_names", {})[token] = label
+    return InlineKeyboardButton(
+        f"▶ Encolar {label} ({len(songs)})"[:60], callback_data=f"playalbum:{token}"
+    )
+
+
 def _play_context_keyboard(
     song: dict | None,
     album_songs: list[dict],
@@ -729,18 +799,8 @@ def _play_context_keyboard(
         suggested_albums = user_data.setdefault("suggested_play_albums", set())
         if normalized_album not in suggested_albums:
             suggested_albums.add(normalized_album)
-            token = uuid.uuid4().hex[:16]
-            user_data.setdefault("pending_album", {})[token] = [
-                str(item["_id"]) for item in album_songs
-            ]
-            user_data.setdefault("pending_album_names", {})[token] = album
-            label = f"▶ Encolar {album} ({len(album_songs)})"
             rows.append(
-                [
-                    InlineKeyboardButton(
-                        label[:60], callback_data=f"playalbum:{token}"
-                    )
-                ]
+                [_queue_selection_button(album_songs, album, context, user_id)]
             )
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -951,18 +1011,18 @@ async def _enqueue_album_songs(
         RuntimeError,
         ValueError,
     ) as exc:
-        logger.exception("No se pudo confirmar el inicio del álbum")
+        logger.exception("No se pudo confirmar el inicio de la selección")
         queue.clear()
         await _persist_queue_state(context, user_id, chat_id)
         await message.reply_text(
-            _device_failure_message(exc, "reproducir el álbum")
+            _device_failure_message(exc, "reproducir la selección")
         )
     except Exception:
-        logger.exception("El ESP32 rechazó el inicio del álbum")
+        logger.exception("El ESP32 rechazó el inicio de la selección")
         queue.clear()
         await _persist_queue_state(context, user_id, chat_id)
         await message.reply_text(
-            "El reproductor rechazó el álbum. Comprueba las rutas de la microSD."
+            "El reproductor rechazó la selección. Comprueba las rutas de la microSD."
         )
 
 
@@ -1410,7 +1470,7 @@ async def play_album_suggestion_callback(
             "Esta sugerencia venció. Pide la recomendación otra vez.", show_alert=True
         )
         return
-    await query.answer("Agregando el álbum a la cola…")
+    await query.answer("Agregando las canciones a la cola…")
     settings: Settings = context.application.bot_data["player_settings"]
     if not settings.player_enabled:
         await query.message.reply_text("El reproductor ESP32 no está habilitado.")
@@ -1419,14 +1479,14 @@ async def play_album_suggestion_callback(
     try:
         songs = await asyncio.to_thread(database.find_songs_by_ids, song_ids)
     except PyMongoError:
-        logger.exception("No se pudo recuperar el álbum sugerido desde MongoDB")
+        logger.exception("No se pudo recuperar la selección desde MongoDB")
         await query.message.reply_text(
-            "No pude consultar la biblioteca para agregar ese álbum a la cola."
+            "No pude consultar la biblioteca para agregar esas canciones a la cola."
         )
         return
     if not songs:
         await query.message.reply_text(
-            "Las canciones del álbum ya no tienen rutas válidas en la microSD."
+            "Las canciones seleccionadas ya no tienen rutas válidas en la microSD."
         )
         return
     album = context.user_data.get("pending_album_names", {}).pop(token, "álbum")
@@ -2073,6 +2133,8 @@ async def process_text_message(
         await persona_queue_request(update, context, message)
     elif _ALBUM_PLAY_REQUEST.search(message):
         await album_play_request(update, context, message)
+    elif _QUEUE_ADD_REQUEST.search(message):
+        await recommend_text(message, update, context)
     elif _REPEAT_PLAYBACK_REQUEST.search(message):
         await repeat_last_song(update, context)
     elif _CORRECTION_REQUEST.search(message):
@@ -2107,15 +2169,37 @@ async def voice_message(
         return
 
     await message.chat.send_action("typing")
-    try:
-        audio_file = await context.bot.get_file(voice.file_id)
-        audio = bytes(await audio_file.download_as_bytearray())
-    except TelegramError:
-        logger.exception("No se pudo descargar el mensaje de voz de Telegram")
-        await message.reply_text(
-            "No pude descargar el audio de Telegram. Inténtalo otra vez."
-        )
-        return
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            audio_file = await context.bot.get_file(
+                voice.file_id, read_timeout=30, connect_timeout=10
+            )
+            audio = bytes(
+                await audio_file.download_as_bytearray(
+                    read_timeout=30, connect_timeout=10
+                )
+            )
+            break
+        except TelegramError as exc:
+            transient = isinstance(exc, NetworkError) and not isinstance(exc, BadRequest)
+            logger.warning(
+                "No se pudo descargar la voz de Telegram (intento %s/3, %s)",
+                attempt, type(exc).__name__,
+            )
+            if transient and attempt < 3:
+                await asyncio.sleep(attempt)
+                continue
+            await message.reply_text(
+                "No pude descargar el audio de Telegram tras 3 intentos. "
+                "Revisa la conexión a Internet del PC y vuelve a enviarlo, "
+                "o escribe el pedido."
+                if transient else
+                "Telegram no permitió descargar ese audio. Vuelve a enviarlo "
+                "o escribe el pedido."
+            )
+            return
 
     ai: AIService = context.application.bot_data["ai"]
     try:
