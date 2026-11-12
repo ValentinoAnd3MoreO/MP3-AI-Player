@@ -30,7 +30,7 @@ class DeviceClient:
         )
         response.raise_for_status()
         result = response.json()
-        if result.get("accepted") is not True:
+        if not isinstance(result, dict) or result.get("accepted") is not True:
             raise RuntimeError(f"El ESP32 no confirmó la orden {command}.")
         logger.info("El ESP32 aceptó la orden %s.", command)
 
@@ -44,3 +44,29 @@ class DeviceClient:
 
     def resume(self) -> None:
         self._send_command("resume")
+
+    def stop(self) -> None:
+        self._send_command("stop")
+
+    def poll_events(self) -> dict:
+        if not self.settings.player_enabled:
+            raise PlayerNotConfiguredError(
+                "La reproducción ESP32 está desactivada en la configuración."
+            )
+        response = requests.get(
+            f"{self.settings.esp32_base_url}/api/events",
+            headers={"Authorization": f"Bearer {self.settings.esp32_api_token}"},
+            timeout=min(self.settings.ai_timeout_seconds, 2),
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or result.get("accepted") is not True:
+            raise RuntimeError("El ESP32 no confirmó la consulta de eventos.")
+        return result
+
+    def set_volume(self, volume: int) -> None:
+        if not isinstance(volume, int) or isinstance(volume, bool):
+            raise ValueError("El volumen debe ser un entero entre 0 y 30.")
+        if not 0 <= volume <= 30:
+            raise ValueError("El volumen debe estar entre 0 y 30.")
+        self._send_command("volume", {"volume": volume})

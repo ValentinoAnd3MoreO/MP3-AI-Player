@@ -1,5 +1,7 @@
-import logging
 import re
+import unicodedata
+from difflib import SequenceMatcher
+import logging
 
 import requests
 
@@ -7,6 +9,21 @@ from app.ai_service import AIService, WebSearch
 from app.database import SongDatabase
 
 logger = logging.getLogger(__name__)
+
+_PERSONA_GAME_REQUEST = re.compile(r"\bpersona\b", re.IGNORECASE)
+
+
+def requested_song_count(request_text: str) -> int | None:
+    match = re.search(
+        r"\b(\d{1,3})\s+(?:canciones?|temas?|pistas?)\b",
+        request_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    count = int(match.group(1))
+    return min(count, 100) if count > 0 else None
+
 
 _TITLE_FILLER = {
     "algo", "cancion", "canciones", "de", "el", "escucha", "escuchar",
@@ -73,6 +90,28 @@ def _title_from_request(request_text: str) -> str | None:
     return " ".join(title_words)
 
 
+def _corrected_title_from_request(request_text: str) -> str | None:
+    marker = re.search(
+        r"\b(?:quise\s+decir|quer[ií]a\s+decir|me\s+refer[ií]a\s+a)\b",
+        request_text,
+        re.IGNORECASE,
+    )
+    if not marker:
+        return None
+
+    before_marker = request_text[: marker.start()]
+    after_marker = request_text[marker.end() :]
+    candidates = [
+        re.split(r"[,.;:!?¿¡]\s*", before_marker)[-1].strip(" \t\"'«»"),
+        after_marker.strip(" \t,.;:!?¿¡\"'«»"),
+    ]
+    for candidate in candidates:
+        words = re.findall(r"[^\W_]+", candidate, flags=re.UNICODE)
+        if 2 <= len(words) <= 8:
+            return candidate
+    return None
+
+
 def _unique_songs(songs: list[dict]) -> list[dict]:
     unique = []
     positions = {}
@@ -90,6 +129,45 @@ def _unique_songs(songs: list[dict]) -> list[dict]:
     return unique
 
 
+def _normalized_artist(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    without_accents = "".join(
+        character for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.findall(r"[^\W_]+", without_accents, flags=re.UNICODE))
+
+
+def _best_matching_artist(
+    requested_artist: str, songs: list[dict]
+) -> str | None:
+    requested = _normalized_artist(requested_artist)
+    if len(requested.replace(" ", "")) < 8:
+        return None
+
+    artist_names = {}
+    for song in songs:
+        for artist in re.split(r"\s*/\s*|\s*;\s*", str(song.get("artist", ""))):
+            normalized = _normalized_artist(artist)
+            if normalized:
+                artist_names.setdefault(normalized, artist.strip())
+
+    matches = sorted(
+        (
+            SequenceMatcher(None, requested, normalized).ratio(),
+            normalized,
+        )
+        for normalized in artist_names
+    )
+    if not matches:
+        return None
+    best_score, best_normalized = matches[-1]
+    second_score = matches[-2][0] if len(matches) > 1 else 0
+    if best_score < 0.84 or best_score - second_score < 0.06:
+        return None
+    return artist_names[best_normalized]
+
+
 class Recommender:
     def __init__(self, database: SongDatabase, ai: AIService, web: WebSearch):
         self.database = database
@@ -97,10 +175,28 @@ class Recommender:
         self.web = web
 
     def recommend(
-        self, request_text: str, history: list[dict[str, str]] | None = None
+        self,
+        request_text: str,
+        history: list[dict[str, str]] | None = None,
+        excluded_ids: list[str] | None = None,
     ) -> tuple[list[dict], bool]:
         filters = self.ai.extract_filters(request_text, history or [])
-        candidates = self.database.find_candidates(build_mongo_query(filters), limit=100)
+        requested_count = requested_song_count(request_text)
+        if requested_count:
+            filters["limit"] = requested_count
+        corrected_title = _corrected_title_from_request(request_text)
+        candidates = []
+        if _PERSONA_GAME_REQUEST.search(request_text):
+            candidates = self.database.find_playable_songs_by_folder(2)
+        elif corrected_title:
+            candidates = self.database.find_candidates(
+                {"title": {"$regex": re.escape(corrected_title), "$options": "i"}},
+                limit=100,
+            )
+        if not candidates:
+            candidates = self.database.find_candidates(
+                build_mongo_query(filters), limit=100
+            )
         if not candidates:
             relaxed_filters = {
                 **filters,
@@ -118,6 +214,29 @@ class Recommender:
                     {"title": {"$regex": re.escape(title), "$options": "i"}},
                     limit=100,
                 )
+        if not candidates and filters.get("artist"):
+            library_songs = self.database.find_candidates({}, limit=1000)
+            matched_artist = _best_matching_artist(
+                filters["artist"], library_songs
+            )
+            if matched_artist:
+                matched_artist_name = _normalized_artist(matched_artist)
+                candidates = [
+                    song
+                    for song in library_songs
+                    if any(
+                        _normalized_artist(artist) == matched_artist_name
+                        for artist in re.split(
+                            r"\s*/\s*|\s*;\s*",
+                            str(song.get("artist", "")),
+                        )
+                    )
+                ]
+        excluded = set(excluded_ids or [])
+        if excluded:
+            candidates = [
+                song for song in candidates if str(song.get("_id")) not in excluded
+            ]
         if not candidates:
             return [], False
         candidates = _unique_songs(candidates)

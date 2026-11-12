@@ -69,7 +69,15 @@ def _read_request(connection):
 
 def _respond(connection, status, payload):
     body = json.dumps(payload).encode()
-    reason = "OK" if status == 200 else "Bad Request" if status == 400 else "Unauthorized"
+    reason = (
+        "OK"
+        if status == 200
+        else "Unauthorized"
+        if status == 401
+        else "Bad Gateway"
+        if status == 502
+        else "Bad Request"
+    )
     response = (
         "HTTP/1.1 {} {}\r\n"
         "Content-Type: application/json\r\n"
@@ -85,24 +93,66 @@ def _respond(connection, status, payload):
 
 
 def _handle(connection, player):
+    stage = "leer solicitud HTTP"
     try:
         method, path, headers, body = _read_request(connection)
         supplied = headers.get("authorization", "")
         expected = "Bearer " + config.API_TOKEN
+        stage = "validar autenticación"
         if not _constant_time_equal(supplied, expected):
             _respond(connection, 401, {"accepted": False, "error": "unauthorized"})
+            return
+        if method == "GET" and path == "/api/events":
+            events = player.finished_event_count()
+            _respond(
+                connection,
+                200,
+                {
+                    "accepted": True,
+                    "track_finished_events": events,
+                    "current_path": player.current_path,
+                    "paused": player.paused,
+                },
+            )
             return
         if method != "POST":
             _respond(connection, 400, {"accepted": False, "error": "invalid_route"})
             return
 
+        stage = "procesar orden"
         if path == "/api/pause":
+            stage = "confirmar pausa en el DFPlayer"
             player.pause()
             _respond(connection, 200, {"accepted": True, "action": "pause"})
             return
         if path == "/api/resume":
+            stage = "confirmar reanudación en el DFPlayer"
             player.resume()
             _respond(connection, 200, {"accepted": True, "action": "resume"})
+            return
+        if path == "/api/stop":
+            stage = "confirmar detención en el DFPlayer"
+            player.stop()
+            _respond(connection, 200, {"accepted": True, "action": "stop"})
+            return
+        if path == "/api/volume":
+            payload = json.loads(body.decode())
+            if not isinstance(payload, dict):
+                _respond(connection, 400, {"accepted": False, "error": "invalid_payload"})
+                return
+            volume = payload.get("volume")
+            if not isinstance(volume, int) or isinstance(volume, bool):
+                _respond(connection, 400, {"accepted": False, "error": "invalid_volume"})
+                return
+            if not 0 <= volume <= 30:
+                _respond(connection, 400, {"accepted": False, "error": "invalid_volume"})
+                return
+            player.set_volume(volume)
+            _respond(
+                connection,
+                200,
+                {"accepted": True, "action": "volume", "volume": player.volume},
+            )
             return
         if path != "/api/play":
             _respond(connection, 400, {"accepted": False, "error": "invalid_route"})
@@ -133,11 +183,23 @@ def _handle(connection, player):
             _respond(connection, 400, {"accepted": False, "error": "invalid_sd_path"})
             return
 
+        stage = "enviar pista al DFPlayer"
         player.play_folder_track(folder, track)
         print("Reproduciendo ruta SD:", sd_path)
+        stage = "responder al bot"
         _respond(connection, 200, {"accepted": True, "sd_path": sd_path})
+    except RuntimeError as exc:
+        print("Error durante {}: {}".format(stage, exc))
+        try:
+            _respond(
+                connection,
+                502,
+                {"accepted": False, "error": "dfplayer_unconfirmed", "stage": stage},
+            )
+        except OSError as response_error:
+            print("No se pudo responder al cliente:", response_error)
     except (ValueError, OSError, KeyError, TypeError) as exc:
-        print("Error de solicitud:", exc)
+        print("Error durante {}: {}".format(stage, exc))
         try:
             _respond(connection, 400, {"accepted": False, "error": "bad_request"})
         except OSError as response_error:
@@ -148,12 +210,21 @@ def main():
     if not config.API_TOKEN or len(config.API_TOKEN) < 24:
         raise ValueError("Configura un API_TOKEN aleatorio de al menos 24 caracteres.")
     connect_wifi()
+    equalizer = getattr(config, "PLAYER_EQ", 5)
+    volume = max(0, min(config.PLAYER_VOLUME, 30))
+    print("Volumen DFPlayer configurado (0-30):", volume)
+    print(
+        "Ecualizador configurado "
+        "(0=Normal, 1=Pop, 2=Rock, 3=Jazz, 4=Classic, 5=Bass):",
+        equalizer,
+    )
     player = DFPlayer(
         config.UART_ID,
         config.UART_TX_PIN,
         config.UART_RX_PIN,
         config.UART_BAUDRATE,
-        config.PLAYER_VOLUME,
+        volume,
+        equalizer,
     )
 
     address = socket.getaddrinfo("0.0.0.0", config.HTTP_PORT)[0][-1]
@@ -161,10 +232,21 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(address)
     server.listen(2)
+    server.settimeout(0.25)
     print("Servidor del DFPlayer escuchando en el puerto", config.HTTP_PORT)
 
     while True:
-        connection, remote = server.accept()
+        player.poll()
+        try:
+            connection, remote = server.accept()
+        except OSError as exc:
+            if (
+                "timed out" in str(exc).lower()
+                or "etimedout" in str(exc).lower()
+                or (exc.args and exc.args[0] in (110, 116))
+            ):
+                continue
+            raise
         try:
             connection.settimeout(4)
             _handle(connection, player)
@@ -173,5 +255,3 @@ def main():
 
 
 main()
-
-

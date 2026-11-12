@@ -62,8 +62,21 @@ def _song_document(path: Path, sd_root: Path) -> dict | None:
         "dfplayer_folder": folder_number,
         "dfplayer_track": track_number,
     }
+    unset_fields = []
     if album:
         document["album"] = album
+    track_number = _tag_text(metadata.tags, "tracknumber")
+    track_match = re.match(r"\s*(\d+)", track_number or "")
+    if track_match:
+        document["album_track_number"] = int(track_match.group(1))
+    else:
+        unset_fields.append("album_track_number")
+    disc_number = _tag_text(metadata.tags, "discnumber")
+    disc_match = re.match(r"\s*(\d+)", disc_number or "")
+    if disc_match:
+        document["album_disc_number"] = int(disc_match.group(1))
+    else:
+        unset_fields.append("album_disc_number")
     if genres:
         document["genre"] = genres
     duration = getattr(getattr(metadata, "info", None), "length", None)
@@ -73,7 +86,9 @@ def _song_document(path: Path, sd_root: Path) -> dict | None:
         document["year"] = int(year_match.group())
         document["decade"] = (document["year"] // 10) * 10
     elif year_match:
-        document["_unset_fields"] = ["year", "decade"]
+        unset_fields.extend(["year", "decade"])
+    if unset_fields:
+        document["_unset_fields"] = unset_fields
     return document
 
 
@@ -97,6 +112,12 @@ def index_sd_card(sd_root: Path, collection) -> tuple[int, int]:
             skipped += 1
             continue
         unset_fields = document.pop("_unset_fields", [])
+        year_unset_fields = [
+            field for field in unset_fields if field in {"year", "decade"}
+        ]
+        unset_fields = [
+            field for field in unset_fields if field not in {"year", "decade"}
+        ]
         update = {"$set": document}
         if unset_fields:
             update["$unset"] = {field: "" for field in unset_fields}
@@ -119,10 +140,34 @@ def index_sd_card(sd_root: Path, collection) -> tuple[int, int]:
                 {"_id": existing["_id"]},
                 update,
             )
+            if year_unset_fields:
+                collection.update_one(
+                    {
+                        "_id": existing["_id"],
+                        "$or": [
+                            {"year_source": {"$exists": False}},
+                            {"year_source": None},
+                            {"year_source": ""},
+                        ],
+                    },
+                    {"$unset": {field: "" for field in year_unset_fields}},
+                )
         matching_songs = collection.update_many(
             identity_query,
             update,
         )
+        if year_unset_fields:
+            collection.update_many(
+                {
+                    **identity_query,
+                    "$or": [
+                        {"year_source": {"$exists": False}},
+                        {"year_source": None},
+                        {"year_source": ""},
+                    ],
+                },
+                {"$unset": {field: "" for field in year_unset_fields}},
+            )
         if not existing and not matching_songs.matched_count:
             folder, track = parse_sd_path(document["sd_path"])
             document_id = f"dfplayer-{folder:02d}-{track:03d}"

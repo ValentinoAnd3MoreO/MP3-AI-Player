@@ -1,0 +1,12 @@
+WIFI_SSID = "nombre_de_tu_wifi"
+WIFI_PASSWORD = "contrasena_de_tu_wifi"
+API_TOKEN = "reemplaza_por_un_token_aleatorio_de_24_caracteres_o_mas"
+
+HTTP_PORT = 8080
+UART_ID = 1
+UART_TX_PIN = 17
+UART_RX_PIN = 16
+UART_BAUDRATE = 9600
+
+PLAYER_VOLUME = 22
+PLAYER_EQ = 5

@@ -219,6 +219,30 @@ class PlaybackHistory:
         )
         return result.modified_count == 1
 
+    def stop(self) -> bool:
+        now = datetime.now(timezone.utc)
+        active = self.collection.find_one(
+            {"ended_at": {"$exists": False}},
+            sort=[("started_at", -1)],
+        )
+        if not active:
+            return False
+        update = {
+            "$set": {"ended_at": now, "end_reason": "stopped"},
+        }
+        query = {"_id": active["_id"], "ended_at": {"$exists": False}}
+        if active.get("pause_started_at"):
+            query["pause_started_at"] = active["pause_started_at"]
+            update["$push"] = {
+                "pause_intervals": {
+                    "started_at": active["pause_started_at"],
+                    "ended_at": now,
+                }
+            }
+            update["$unset"] = {"pause_started_at": ""}
+        result = self.collection.update_one(query, update)
+        return result.modified_count == 1
+
     def report(self, period: str, now: datetime | None = None) -> dict:
         start, end = report_period_bounds(period, now)
         query = {
