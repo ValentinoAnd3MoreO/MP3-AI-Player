@@ -1,28 +1,3 @@
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB=110Music
-MONGO_COLLECTION=songs
-
-# Telegram: crea el bot desde @BotFather
-TELEGRAM_BOT_TOKEN=8867119429:AAF15RiE_5qZJo9mCsW8cGV4Jh1cREKku2Q
-
-# Compatible con API OpenAI (OpenAI, Ollama, LM Studio y otros proveedores)
-AI_MODEL=gpt-4o-mini
-AI_BASE_URL=
-AI_API_KEY=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
-AI_TIMEOUT_SECONDS=30
-AI_TOP_RESULTS=5
-
-# BÃºsqueda opcional en Internet mediante Tavily.
-# La selecciÃ³n final siempre queda limitada a canciones existentes en MongoDB.
-WEB_SEARCH_ENABLED=true
-WEB_SEARCH_API_KEY=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
-WEB_SEARCH_MAX_RESULTS=5
-PLAYER_ENABLED=true
-ESP32_BASE_URL=http://10.0.50.187:8080
-ESP32_API_TOKEN=1c5ee3ac4542ee4fe0517d4d4871f5c0b6ed4f9fe4e4811ee78399017c146091
-
-
-
 # MP3 AI Player: Telegram, MongoDB e IA configurable
 
 Prototipo ejecutable de un bot de Telegram que conversa sobre música, recomienda temas desde MongoDB y ofrece botones para reproducir los MP3 que estén mapeados a la microSD de un DFPlayer Mini conectado a un ESP32.
