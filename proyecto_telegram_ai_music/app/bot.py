@@ -9,7 +9,13 @@ from types import SimpleNamespace
 
 import requests
 from telegram.error import BadRequest, NetworkError, TelegramError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -244,7 +250,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "También puedes pedirme un álbum completo y controlar la cola con "
         "/cola, /skip y /loop. Puedes enviarme mensajes de voz. Usa /help "
         "para ver los comandos; /autoplay on|off activa o desactiva el inicio "
-        "automático de canciones."
+        "automático de canciones. Los controles quedan en el teclado inferior; "
+        "si los ocultas, usa /reproductor para volver a mostrarlos.",
+        reply_markup=_player_reply_keyboard(),
     )
 
 
@@ -259,6 +267,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "También puedes enviar un mensaje de voz. Si hay una canción disponible "
         "en tu microSD, te ofreceré reproducirla.\n\n"
         "REPRODUCCIÓN\n"
+        "• /reproductor — muestra el estado y el teclado de controles abajo.\n"
+        "Los botones envían su acción al chat, sin pasar por la IA. Puedes "
+        "ocultar el teclado para escribir y volver a abrirlo con /reproductor.\n"
         "• /pausar — pausa la canción.\n"
         "• /reanudar — continúa la canción.\n"
         "• /detener o /parar — detiene la música y vacía la cola.\n"
@@ -278,7 +289,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /buscar rock de los 90 — busca música en tu biblioteca.\n"
         "• /reportes diario o /reportes semanal — resumen de reproducción.\n"
         "• /reset — borra el contexto reciente de la conversación.\n"
-        "• /help — muestra esta ayuda."
+        "• /help — muestra esta ayuda.",
+        reply_markup=_player_reply_keyboard(),
     )
 
 
@@ -805,6 +817,20 @@ def _play_context_keyboard(
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def _player_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["⏸ Pausar", "▶ Reanudar"],
+            ["⏭ Siguiente", "📃 Ver cola"],
+            ["🔁 Loop", "⏹ Detener"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
+        input_field_placeholder="Pide música o usa los controles",
+    )
+
+
 def _player_control_keyboard(
     queue: PlaybackQueue, paused: bool = False
 ) -> InlineKeyboardMarkup:
@@ -911,7 +937,6 @@ async def _start_queued_song(
     user_data = context.application.user_data.get(user_id)
     if user_data is not None:
         user_data["last_played_song_id"] = str(song["_id"])
-    queue: PlaybackQueue = context.application.bot_data["playback_queue"]
     bot_data = context.application.bot_data
     bot_data["queue_song_started_at"] = datetime.now(timezone.utc)
     bot_data["queue_user_id"] = user_id
@@ -926,7 +951,7 @@ async def _start_queued_song(
             f"— {html.escape(str(song.get('artist') or 'Artista desconocido'))}"
             f"{history_warning}{status_note}",
             parse_mode=ParseMode.HTML,
-            reply_markup=_player_control_keyboard(queue),
+            reply_markup=_player_reply_keyboard(),
         )
     except TelegramError:
         logger.exception(
@@ -1621,7 +1646,7 @@ async def player_control_callback(
 
 
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    target_title = " ".join(context.args).strip()
+    target_title = " ".join(context.args or []).strip()
     if target_title:
         await jump_to_queued_song(
             context,
@@ -1715,6 +1740,20 @@ async def jump_to_queued_song(
             await message.reply_text(
                 "El ESP32 aceptó la canción, pero no pude actualizar el estado de la cola."
             )
+
+
+async def player_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot_data = context.application.bot_data
+    queue: PlaybackQueue = bot_data["playback_queue"]
+    status = _format_queue(queue)
+    if queue.current and bot_data.get("queue_paused"):
+        status += "\nReproducción pausada."
+    await update.effective_message.reply_text(
+        status + "\n\nControles disponibles en el teclado inferior. "
+        "Puedes ocultarlo para escribir y volver a mostrarlo con /reproductor.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_player_reply_keyboard(),
+    )
 
 
 async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2079,6 +2118,18 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def process_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE, message: str
 ) -> None:
+    player_buttons = {
+        "⏸ Pausar": pause_command,
+        "▶ Reanudar": resume_command,
+        "⏭ Siguiente": skip_command,
+        "📃 Ver cola": queue_command,
+        "🔁 Loop": loop_command,
+        "⏹ Detener": stop_command,
+    }
+    player_action = player_buttons.get(message.strip())
+    if player_action is not None:
+        await player_action(update, context)
+        return
     if _NEGATED_QUEUE_CHANGE_REQUEST.search(message):
         await update.effective_message.reply_text(
             "No toqué la cola. Si querías cambiarla, dime qué canciones "
@@ -2510,6 +2561,7 @@ def create_application(settings: Settings) -> Application:
     application.bot_data["autoplay_users"] = {}
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("reproductor", player_command))
     application.add_handler(CommandHandler("reset", reset_chat))
     application.add_handler(CommandHandler("buscar", search_command))
     application.add_handler(CommandHandler("pausar", pause_command))

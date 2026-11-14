@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import requests
+from telegram import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import CommandHandler
 
+from app import bot as bot_module
 from app.ai_service import AIService
 from app.bot import (
     _ALBUM_PLAY_REQUEST,
@@ -23,6 +26,166 @@ from app.bot import (
 from app.database import SongDatabase
 from app.playback_queue import PlaybackQueue
 from app.playback_state import PlaybackStateStore
+
+
+class PersistentPlayerKeyboardTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.songs = [
+            {"_id": "first", "title": "First", "sd_path": "/01/001.mp3"},
+            {"_id": "second", "title": "Second", "sd_path": "/01/002.mp3"},
+        ]
+        self.queue = PlaybackQueue()
+        self.queue.enqueue(self.songs)
+        self.device = Mock()
+        self.message = SimpleNamespace(reply_text=AsyncMock())
+        self.update = SimpleNamespace(
+            message=self.message,
+            effective_message=self.message,
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=100),
+            callback_query=None,
+        )
+        self.context = SimpleNamespace(
+            args=None,
+            bot=SimpleNamespace(send_message=AsyncMock()),
+            application=SimpleNamespace(
+                user_data={42: {}},
+                bot_data={
+                    "device": self.device,
+                    "playback_history": Mock(),
+                    "playback_queue": self.queue,
+                    "player_settings": SimpleNamespace(player_enabled=True),
+                },
+            ),
+        )
+
+    def assert_persistent_keyboard(self, markup):
+        self.assertIsInstance(markup, ReplyKeyboardMarkup)
+        payload = markup.to_dict()
+        self.assertTrue(payload["is_persistent"])
+        self.assertTrue(payload["resize_keyboard"])
+        self.assertFalse(payload["one_time_keyboard"])
+        return [button.text for row in markup.keyboard for button in row]
+
+    async def test_start_and_help_offer_persistent_controls(self):
+        for handler in (bot_module.start, bot_module.help_command):
+            with self.subTest(handler=handler.__name__):
+                await handler(self.update, self.context)
+                self.assert_persistent_keyboard(
+                    self.message.reply_text.await_args.kwargs.get("reply_markup")
+                )
+                self.assertIn("/reproductor", self.message.reply_text.await_args.args[0])
+
+    async def test_playback_message_installs_keyboard_not_inline_controls(self):
+        await bot_module._start_queued_song(
+            self.songs[0], self.context, 42, 100
+        )
+        self.assert_persistent_keyboard(
+            self.context.bot.send_message.await_args.kwargs["reply_markup"]
+        )
+
+    async def test_all_keyboard_buttons_control_player_after_conversation_without_ai(self):
+        with (
+            patch("app.bot.chat_message", new_callable=AsyncMock) as chat,
+            patch("app.bot.recommend_text", new_callable=AsyncMock) as recommend,
+        ):
+            await bot_module.process_text_message(self.update, self.context, "hola")
+            chat.assert_awaited_once()
+            chat.reset_mock()
+            await bot_module.start(self.update, self.context)
+            labels = self.assert_persistent_keyboard(
+                self.message.reply_text.await_args.kwargs.get("reply_markup")
+            )
+            self.assertEqual(labels, [
+                "⏸ Pausar", "▶ Reanudar", "⏭ Siguiente", "📃 Ver cola",
+                "🔁 Loop", "⏹ Detener",
+            ])
+
+            await process_text_message(self.update, self.context, labels[0])
+            self.device.pause.assert_called_once()
+            self.assertTrue(self.context.application.bot_data["queue_paused"])
+            await process_text_message(self.update, self.context, labels[1])
+            self.device.resume.assert_called_once()
+            self.assertFalse(self.context.application.bot_data["queue_paused"])
+            await process_text_message(self.update, self.context, labels[2])
+            self.device.play.assert_called_once_with(self.songs[1]["sd_path"])
+            self.assertIs(self.queue.current, self.songs[1])
+            await process_text_message(self.update, self.context, labels[3])
+            self.assertIn("Second", self.message.reply_text.await_args.args[0])
+            await process_text_message(self.update, self.context, labels[4])
+            self.assertEqual(self.queue.repeat_mode, "all")
+            await process_text_message(self.update, self.context, labels[5])
+            self.device.stop.assert_called_once()
+            self.assertIsNone(self.queue.current)
+            chat.assert_not_awaited()
+            recommend.assert_not_awaited()
+
+    async def test_failed_keyboard_pause_does_not_report_success_or_change_state(self):
+        self.device.pause.side_effect = RuntimeError("No confirmation")
+        self.context.application.bot_data["queue_paused"] = False
+        await process_text_message(self.update, self.context, "⏸ Pausar")
+        self.assertFalse(self.context.application.bot_data["queue_paused"])
+        self.assertIn("no aceptó", self.message.reply_text.await_args.args[0])
+        self.assertIs(self.queue.current, self.songs[0])
+
+    async def test_control_label_in_conversation_is_not_executed(self):
+        with patch("app.bot.chat_message", new_callable=AsyncMock) as chat:
+            await process_text_message(
+                self.update, self.context, "¿Qué significa el botón ⏸ Pausar?"
+            )
+        self.device.pause.assert_not_called()
+        chat.assert_awaited_once()
+
+    async def test_reproductor_command_restores_keyboard_and_reports_paused_or_empty_queue(self):
+        settings = SimpleNamespace(telegram_bot_token="123:test-token", mongo_db="test")
+        with (
+            patch("app.bot.SongDatabase"),
+            patch("app.bot.AIService"),
+            patch("app.bot.WebSearch"),
+        ):
+            application = bot_module.create_application(settings)
+        handler = next(
+            handler for handler in application.handlers[0]
+            if isinstance(handler, CommandHandler) and "reproductor" in handler.commands
+        )
+        self.context.application.bot_data["queue_paused"] = True
+
+        await handler.callback(self.update, self.context)
+
+        reply = self.message.reply_text.await_args
+        self.assertIn("First", reply.args[0])
+        self.assertIn("Second", reply.args[0])
+        self.assertIn("Reproducción pausada", reply.args[0])
+        self.assert_persistent_keyboard(reply.kwargs["reply_markup"])
+        self.queue.clear()
+
+        await handler.callback(self.update, self.context)
+
+        self.assertIn("La cola está vacía", self.message.reply_text.await_args.args[0])
+        self.assert_persistent_keyboard(
+            self.message.reply_text.await_args.kwargs["reply_markup"]
+        )
+        self.device.play.assert_not_called()
+
+    async def test_legacy_inline_pause_and_loop_buttons_still_work(self):
+        query = SimpleNamespace(
+            data="control:pause", answer=AsyncMock(), edit_message_reply_markup=AsyncMock()
+        )
+        self.update.callback_query = query
+
+        await bot_module.player_control_callback(self.update, self.context)
+
+        self.device.pause.assert_called_once()
+        markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertIsInstance(markup, InlineKeyboardMarkup)
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "control:resume")
+
+        await bot_module.toggle_loop_callback(self.update, self.context)
+
+        self.assertEqual(self.queue.repeat_mode, "all")
+        markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "control:resume")
+        self.assertIn("cola", markup.inline_keyboard[1][1].text)
 
 
 class RecommendationQueueTests(unittest.IsolatedAsyncioTestCase):
