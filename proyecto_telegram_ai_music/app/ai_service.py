@@ -22,6 +22,13 @@ _FILTER_KEYS = {
     "limit",
 }
 
+_VOICE_TRANSCRIPTION_PROMPT = (
+    "Transcribe literalmente en español rioplatense. Es una solicitud hablada "
+    "para un reproductor de música. Conserva los nombres de artistas, bandas "
+    "y canciones. Las órdenes pueden incluir «poneme», «poné rock de los 80», "
+    "«recomendame», «pausá» o «pasá a la siguiente»."
+)
+
 
 class AIQuotaExceededError(Exception):
     """The configured AI provider has no usable credits or quota."""
@@ -75,6 +82,7 @@ class AIService:
                 model=self.settings.ai_transcription_model,
                 file=(filename, audio, "audio/ogg"),
                 language="es",
+                prompt=_VOICE_TRANSCRIPTION_PROMPT,
             )
         except RateLimitError as exc:
             if _is_quota_error(exc):

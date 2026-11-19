@@ -4,6 +4,8 @@ API_TOKEN = "reemplaza_por_un_token_aleatorio_de_24_caracteres_o_mas"
 
 HTTP_PORT = 8080
 UART_ID = 1
+# En un ESP32 DevKit clasico, GPIO34-39 son solo de entrada:
+# GPIO34 sirve como RX, pero no uses GPIO35 como TX.
 UART_TX_PIN = 17
 UART_RX_PIN = 16
 UART_BAUDRATE = 9600

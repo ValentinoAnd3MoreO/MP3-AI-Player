@@ -94,6 +94,13 @@ class AIQuotaDetectionTests(unittest.TestCase):
             model="whisper-test",
             file=("voice.ogg", b"ogg-data", "audio/ogg"),
             language="es",
+            prompt=(
+                "Transcribe literalmente en español rioplatense. Es una "
+                "solicitud hablada para un reproductor de música. Conserva "
+                "los nombres de artistas, bandas y canciones. Las órdenes "
+                "pueden incluir «poneme», «poné rock de los 80», "
+                "«recomendame», «pausá» o «pasá a la siguiente»."
+            ),
         )
 
     def test_rejects_empty_audio_and_empty_transcriptions(self):
